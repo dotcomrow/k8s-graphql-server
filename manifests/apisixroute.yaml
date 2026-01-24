@@ -14,7 +14,6 @@ spec:
       match:
         hosts:
           - "graphql.app.suncoast.systems"
-          - "*.graphql.app.suncoast.systems"
         paths: ["/v1/graphql", "/v1/graphql/*"]
       backends:
         - serviceName: hasura

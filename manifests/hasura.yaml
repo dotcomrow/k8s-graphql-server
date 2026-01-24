@@ -46,7 +46,7 @@ spec:
               value: "false"
             - name: HASURA_GRAPHQL_ENABLED_LOG_TYPES
               value: "startup, http-log, websocket-log, query-log"
-            - name: HASURA_GRAPHQL_JWT_SECRET
+            - name: HASURA_GRAPHQL_JWT_SECRETS
               value: '[{"type":"RS256","jwk_url":"https://auth.suncoast.systems/realms/internal/protocol/openid-connect/certs","issuer":"https://auth.suncoast.systems/realms/internal","audience":"hasura-console-proxy","claims_namespace_path":"$.[\"https://hasura.io/jwt/claims\"]"},{"type":"RS256","jwk_url":"https://auth.suncoast.systems/realms/external/protocol/openid-connect/certs","issuer":"https://auth.suncoast.systems/realms/external","claims_namespace_path":"$.[\"https://hasura.io/jwt/claims\"]"}]'
           command: ["/bin/sh","-c"]
           args:

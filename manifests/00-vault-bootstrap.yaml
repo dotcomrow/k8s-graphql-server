@@ -1,15 +1,4 @@
 apiVersion: v1
-kind: Secret
-metadata:
-  name: graphql-vault-bootstrap-token
-  namespace: vault
-  annotations:
-    argocd.argoproj.io/sync-wave: "-6"
-type: Opaque
-stringData:
-  VAULT_TOKEN: "<path:secret/data/vaultadmin#value>"
----
-apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: graphql-vault-bootstrap
@@ -37,7 +26,7 @@ spec:
       volumes:
         - name: bootstrap-token
           secret:
-            secretName: graphql-vault-bootstrap-token
+            secretName: vault-root-token
       containers:
         - name: bootstrap
           image: hashicorp/vault:1.15.4
@@ -54,15 +43,23 @@ spec:
           args:
             - |
               set -euo pipefail
-              TOKEN_FILE="/vault/bootstrap/VAULT_TOKEN"
+              TOKEN_DIR="/vault/bootstrap"
+              VAULT_TOKEN=""
 
-              until [ -s "$TOKEN_FILE" ]; do
-                echo "Waiting for bootstrap token at ${TOKEN_FILE}..."
-                sleep 5
+              while [ -z "${VAULT_TOKEN}" ]; do
+                for key in VAULT_TOKEN token root-token root_token; do
+                  if [ -s "${TOKEN_DIR}/${key}" ]; then
+                    VAULT_TOKEN="$(cat "${TOKEN_DIR}/${key}")"
+                    break
+                  fi
+                done
+                if [ -z "${VAULT_TOKEN}" ]; then
+                  echo "Waiting for bootstrap token in ${TOKEN_DIR}..."
+                  sleep 5
+                fi
               done
 
               export VAULT_TOKEN
-              VAULT_TOKEN="$(cat "$TOKEN_FILE")"
 
               until vault status >/dev/null 2>&1; do
                 echo "Waiting for Vault at ${VAULT_ADDR}..."

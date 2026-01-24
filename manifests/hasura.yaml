@@ -31,6 +31,7 @@ spec:
           {{- with secret "yugabyte-db/static-creds/graphql-yb-admin" -}}
           postgresql://{{ .Data.username }}:{{ .Data.password }}@yb-tserver-service.yugabyte.svc.cluster.local:5433/hasura?sslmode=disable
           {{- end }}
+        linkerd.io/inject: "enabled"
     spec:
       serviceAccountName: hasura
       containers:

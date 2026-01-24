@@ -71,15 +71,15 @@ spec:
 
               write_policy() {
                 vault policy write graphql-vault-init - <<'EOF'
-                path "sys/mounts" { capabilities = ["read"] }
-                path "sys/mounts/*" { capabilities = ["create","read","update","delete","list"] }
-                path "sys/policies/acl/*" { capabilities = ["create","read","update","delete","list"] }
-                path "auth/kubernetes/role/*" { capabilities = ["create","read","update","delete","list"] }
-                path "secret/data/graphql/*" { capabilities = ["create","read","update","delete","list"] }
-                path "secret/data/vaultadmin" { capabilities = ["read"] }
-                path "secret/data/yugabyte-su" { capabilities = ["read"] }
-                path "yugabyte-db/*" { capabilities = ["create","read","update","delete","list"] }
-                EOF
+              path "sys/mounts" { capabilities = ["read"] }
+              path "sys/mounts/*" { capabilities = ["create","read","update","delete","list"] }
+              path "sys/policies/acl/*" { capabilities = ["create","read","update","delete","list"] }
+              path "auth/kubernetes/role/*" { capabilities = ["create","read","update","delete","list"] }
+              path "secret/data/graphql/*" { capabilities = ["create","read","update","delete","list"] }
+              path "secret/data/vaultadmin" { capabilities = ["read"] }
+              path "secret/data/yugabyte-su" { capabilities = ["read"] }
+              path "yugabyte-db/*" { capabilities = ["create","read","update","delete","list"] }
+              EOF
               }
 
               write_role() {

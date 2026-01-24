@@ -11,6 +11,7 @@ metadata:
   namespace: vault
   annotations:
     argocd.argoproj.io/sync-options: Replace=true,Force=true
+    argocd.argoproj.io/sync-wave: "-4"
 spec:
   backoffLimit: 0
   template:

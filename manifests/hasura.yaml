@@ -1,0 +1,124 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hasura
+  namespace: graphql
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hasura
+  namespace: graphql
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: hasura
+  template:
+    metadata:
+      labels:
+        app: hasura
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "graphql"
+        vault.hashicorp.com/agent-inject-secret-hasura-admin: "secret/data/graphql/hasura-admin"
+        vault.hashicorp.com/agent-inject-template-hasura-admin: |
+          {{- with secret "secret/data/graphql/hasura-admin" -}}
+          {{ .Data.data.admin_secret }}
+          {{- end }}
+        vault.hashicorp.com/agent-inject-secret-db-url: "yugabyte-db/static-creds/graphql-yb-admin"
+        vault.hashicorp.com/agent-inject-template-db-url: |
+          {{- with secret "yugabyte-db/static-creds/graphql-yb-admin" -}}
+          postgresql://{{ .Data.username }}:{{ .Data.password }}@yb-tserver-service.yugabyte.svc.cluster.local:5433/hasura?sslmode=disable
+          {{- end }}
+    spec:
+      serviceAccountName: hasura
+      containers:
+        - name: hasura
+          image: hasura/graphql-engine:v2.38.0
+          ports:
+            - containerPort: 8080
+          env:
+            - name: HASURA_GRAPHQL_ENABLE_CONSOLE
+              value: "true"
+            - name: HASURA_GRAPHQL_DEV_MODE
+              value: "false"
+            - name: HASURA_GRAPHQL_ENABLED_LOG_TYPES
+              value: "startup, http-log, websocket-log, query-log"
+            - name: HASURA_GRAPHQL_JWT_SECRET
+              value: '{"type":"RS256","jwk_url":"https://auth.suncoast.systems/realms/internal/protocol/openid-connect/certs","issuer":"https://auth.suncoast.systems/realms/internal","audience":"hasura-console-proxy","claims_namespace_path":"$.https://hasura.io/jwt/claims"}'
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              set -euo pipefail
+              wait_for_file() {
+                path="$1"
+                while [ ! -s "$path" ]; do
+                  echo "Waiting for $path..."
+                  sleep 2
+                done
+              }
+              wait_for_file /vault/secrets/db-url
+              wait_for_file /vault/secrets/hasura-admin
+
+              read_secrets() {
+                db="$(cat /vault/secrets/db-url)"
+                admin="$(cat /vault/secrets/hasura-admin)"
+              }
+
+              start_hasura() {
+                graphql-engine serve &
+                HASURA_PID=$!
+              }
+
+              read_secrets
+              last_db="$db"
+              last_admin="$admin"
+              export HASURA_GRAPHQL_DATABASE_URL="$last_db"
+              export HASURA_GRAPHQL_ADMIN_SECRET="$last_admin"
+              start_hasura
+
+              while :; do
+                read_secrets
+                if [ "$db" != "$last_db" ] || [ "$admin" != "$last_admin" ]; then
+                  last_db="$db"
+                  last_admin="$admin"
+                  export HASURA_GRAPHQL_DATABASE_URL="$last_db"
+                  export HASURA_GRAPHQL_ADMIN_SECRET="$last_admin"
+                  if kill -0 "$HASURA_PID" 2>/dev/null; then
+                    kill -TERM "$HASURA_PID"
+                    wait "$HASURA_PID" || true
+                  fi
+                  start_hasura
+                elif ! kill -0 "$HASURA_PID" 2>/dev/null; then
+                  start_hasura
+                fi
+                sleep 10
+              done
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hasura
+  namespace: graphql
+spec:
+  selector:
+    app: hasura
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080

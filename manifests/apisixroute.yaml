@@ -1,0 +1,32 @@
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  name: hasura
+  namespace: graphql
+  annotations:
+    apisix.apache.org/timeout: "950"
+    apisix.apache.org/websocket: "true"
+spec:
+  ingressClassName: apisix
+  http:
+    - name: hasura
+      websocket: true
+      match:
+        hosts:
+          - "graphql.app.suncoast.systems"
+          - "*.graphql.app.suncoast.systems"
+        paths: ["/v1/graphql", "/v1/graphql/*"]
+      backends:
+        - serviceName: hasura
+          servicePort: 8080
+      plugins:
+        - name: cors
+          enable: true
+          config:
+            allow_origins_by_regex:
+              - "^https://([a-zA-Z0-9-]+\\.)*graphql\\.app\\.suncoast\\.systems$"
+            allow_origins: "https://graphql.app.suncoast.systems"
+            allow_methods: "GET,POST,PUT,PATCH,DELETE,OPTIONS,HEAD"
+            allow_headers: "Authorization,Content-Type,Accept,Origin,X-Requested-With,Cache-Control,Pragma,User-Agent"
+            allow_credential: true
+            max_age: 86400

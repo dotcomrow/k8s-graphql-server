@@ -23,15 +23,15 @@ spec:
         vault.hashicorp.com/role: "graphql-console"
         vault.hashicorp.com/agent-inject-secret-oauth2.cfg: "secret/data/keycloak-client-id-hasura-console-proxy"
         vault.hashicorp.com/agent-inject-template-oauth2.cfg: |
-          {{- with secret "secret/data/keycloak-client-id-hasura-console-proxy" -}}
+          {{ with secret "secret/data/keycloak-client-id-hasura-console-proxy" }}
           client_id = "{{ .Data.data.value }}"
-          {{- end }}
-          {{- with secret "secret/data/keycloak-client-secret-hasura-console-proxy" -}}
+          {{ end }}
+          {{ with secret "secret/data/keycloak-client-secret-hasura-console-proxy" }}
           client_secret = "{{ .Data.data.value }}"
-          {{- end }}
-          {{- with secret "secret/data/hasura-console-oauth2-proxy-cookie-secret" -}}
+          {{ end }}
+          {{ with secret "secret/data/hasura-console-oauth2-proxy-cookie-secret" }}
           cookie_secret = "{{ .Data.data.value }}"
-          {{- end }}
+          {{ end }}
     spec:
       serviceAccountName: hasura-console-proxy
       containers:

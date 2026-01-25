@@ -595,18 +595,36 @@ data:
                     self.end_headers()
                     self.wfile.write(json.dumps(result).encode("utf-8"))
                 except urllib.error.HTTPError as exc:
-                    self.send_response(exc.code)
-                    content_type = exc.headers.get("Content-Type", "application/json")
-                    self.send_header("Content-Type", content_type)
-                    www_auth = exc.headers.get("WWW-Authenticate")
+                    status = exc.code
+                    raw = exc.read()
+                    text = raw.decode("utf-8", errors="replace") if raw else ""
+                    upstream = {"status": status, "url": getattr(exc, "url", None) or exc.geturl()}
+                    if text:
+                        try:
+                            upstream_body = json.loads(text)
+                        except json.JSONDecodeError:
+                            upstream_body = text
+                        upstream["body"] = upstream_body
+                    www_auth = exc.headers.get("WWW-Authenticate") if exc.headers else None
                     if www_auth:
-                        self.send_header("WWW-Authenticate", www_auth)
+                        upstream["www_authenticate"] = www_auth
+                    detail = None
+                    if isinstance(upstream.get("body"), dict):
+                        detail = upstream["body"].get("detail")
+                    message = f"Upstream HTTP {status}"
+                    if detail:
+                        message = f"Upstream HTTP {status}: {detail}"
+                    payload = {
+                        "message": message,
+                        "extensions": {
+                            "code": "upstream_http_error",
+                            "upstream": upstream,
+                        },
+                    }
+                    self.send_response(status)
+                    self.send_header("Content-Type", "application/json")
                     self.end_headers()
-                    payload = exc.read()
-                    if payload:
-                        self.wfile.write(payload)
-                    else:
-                        self.wfile.write(json.dumps({"error": str(exc)}).encode("utf-8"))
+                    self.wfile.write(json.dumps(payload).encode("utf-8"))
                 except Exception as exc:
                     self.send_response(502)
                     self.send_header("Content-Type", "application/json")

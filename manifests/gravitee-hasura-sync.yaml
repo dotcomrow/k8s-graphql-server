@@ -1,0 +1,729 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: graphql-gravitee-sync
+  namespace: graphql
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: graphql-gravitee-sync
+  namespace: graphql
+data:
+  sync.py: |
+    #!/usr/bin/env python3
+    import base64
+    import json
+    import os
+    import re
+    import threading
+    import time
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    import ssl
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    MANAGED_COMMENT = "managed-by=gravitee-hasura-sync"
+    DEFAULT_OPT_IN_TAGS = "hasura"
+    DEFAULT_ENDPOINT_LABEL = "hasura.endpoint"
+
+    HASURA_URL = os.environ.get("HASURA_URL", "http://hasura.graphql.svc.cluster.local:8080").rstrip("/")
+    HASURA_ADMIN_SECRET_PATH = os.environ.get("HASURA_ADMIN_SECRET_PATH", "/vault/secrets/hasura-admin")
+
+    GRAVITEE_MANAGEMENT_API = os.environ.get(
+        "GRAVITEE_MANAGEMENT_API",
+        "http://gravitee-management-api.k8s-api-gateway.svc.cluster.local:8083/management",
+    ).rstrip("/")
+    GRAVITEE_ORG = os.environ.get("GRAVITEE_ORG", "DEFAULT")
+    GRAVITEE_ENV = os.environ.get("GRAVITEE_ENV", "DEFAULT")
+    GRAVITEE_GATEWAY_URL = os.environ.get(
+        "GRAVITEE_GATEWAY_URL",
+        "http://gravitee-gateway.k8s-api-gateway.svc.cluster.local:8082",
+    ).rstrip("/")
+    GRAVITEE_ADMIN_USERNAME_PATH = os.environ.get("GRAVITEE_ADMIN_USERNAME_PATH", "/vault/secrets/gravitee-admin-username")
+    GRAVITEE_ADMIN_PASSWORD_PATH = os.environ.get("GRAVITEE_ADMIN_PASSWORD_PATH", "/vault/secrets/gravitee-admin-password")
+
+    WEBHOOK_SECRET_PATH = os.environ.get("WEBHOOK_SECRET_PATH", "/vault/secrets/gravitee-webhook-secret")
+    OPT_IN_TAGS = os.environ.get("HASURA_OPT_IN_TAGS", DEFAULT_OPT_IN_TAGS)
+    OPT_IN_LABEL = os.environ.get("HASURA_OPT_IN_LABEL", "")
+    ENDPOINT_LABEL_KEY = os.environ.get("HASURA_ENDPOINT_LABEL", DEFAULT_ENDPOINT_LABEL)
+    MODE_LABEL_KEY = os.environ.get("HASURA_MODE_LABEL", "hasura.mode")
+
+    ACTION_HANDLER_URL = os.environ.get(
+        "ACTION_HANDLER_URL",
+        "http://graphql-gravitee-sync.graphql.svc.cluster.local:8080/action",
+    )
+    SYNC_INTERVAL = int(os.environ.get("SYNC_INTERVAL", "300"))
+    ACTION_TIMEOUT_SECONDS = int(os.environ.get("ACTION_TIMEOUT_SECONDS", "30"))
+    REMOTE_SCHEMA_TIMEOUT_SECONDS = int(os.environ.get("REMOTE_SCHEMA_TIMEOUT_SECONDS", "60"))
+    INSECURE_SKIP_VERIFY = os.environ.get("INSECURE_SKIP_VERIFY", "false").lower() in ("1", "true", "yes")
+
+    OPENAPI_PAGE_TYPES = {"SWAGGER", "OPENAPI"}
+    ACTION_MAP = {}
+    API_DETAIL_CACHE = {}
+    ACTION_LOCK = threading.Lock()
+    SYNC_LOCK = threading.Lock()
+
+    def log(message):
+        print(message, flush=True)
+
+    def read_file(path):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                return handle.read().strip()
+        except FileNotFoundError:
+            return ""
+
+    def urlopen(req, timeout=30):
+        if INSECURE_SKIP_VERIFY and req.full_url.startswith("https://"):
+            ctx = ssl._create_unverified_context()
+            return urllib.request.urlopen(req, timeout=timeout, context=ctx)
+        return urllib.request.urlopen(req, timeout=timeout)
+
+    def gravitee_auth_header():
+        username = read_file(GRAVITEE_ADMIN_USERNAME_PATH)
+        password = read_file(GRAVITEE_ADMIN_PASSWORD_PATH)
+        if not username or not password:
+            raise RuntimeError("Gravitee admin credentials not available")
+        token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("utf-8")
+        return f"Basic {token}"
+
+    def gravitee_request(method, path, payload=None, accept="application/json"):
+        headers = {"Authorization": gravitee_auth_header(), "Accept": accept}
+        data = None
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
+            data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(GRAVITEE_MANAGEMENT_API + path, data=data, headers=headers, method=method)
+        with urlopen(req, timeout=30) as resp:
+            return resp.read()
+
+    def api_id_of(api):
+        return api.get("id") or api.get("_id") or ""
+
+    def get_api_detail(api_id):
+        if api_id in API_DETAIL_CACHE:
+            return API_DETAIL_CACHE[api_id]
+        paths = [
+            f"/v2/organizations/{GRAVITEE_ORG}/environments/{GRAVITEE_ENV}/apis/{api_id}",
+            f"/organizations/{GRAVITEE_ORG}/environments/{GRAVITEE_ENV}/apis/{api_id}",
+        ]
+        for path in paths:
+            try:
+                body = gravitee_request("GET", path)
+                data = json.loads(body.decode("utf-8") or "{}")
+                if data:
+                    API_DETAIL_CACHE[api_id] = data
+                    return data
+            except urllib.error.HTTPError as exc:
+                if exc.code in (404, 405):
+                    continue
+                raise
+        return {}
+
+    def hasura_request(payload):
+        admin_secret = read_file(HASURA_ADMIN_SECRET_PATH)
+        if not admin_secret:
+            raise RuntimeError("Hasura admin secret not available")
+        body = json.dumps(payload).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "X-Hasura-Admin-Secret": admin_secret,
+        }
+        req = urllib.request.Request(f"{HASURA_URL}/v1/metadata", data=body, headers=headers, method="POST")
+        with urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8")
+        return json.loads(raw) if raw else {}
+
+    def parse_label_map(api):
+        labels = api.get("labels") or []
+        label_map = {}
+        for label in labels:
+            label = str(label).strip()
+            if not label:
+                continue
+            if "=" in label:
+                key, value = label.split("=", 1)
+                label_map[key.strip()] = value.strip()
+            else:
+                label_map[label] = "true"
+        return label_map
+
+    def parse_csv(value):
+        if not value:
+            return []
+        return [item.strip() for item in value.split(",") if item.strip()]
+
+    def label_opt_in(labels):
+        if OPT_IN_LABEL:
+            if "=" in OPT_IN_LABEL:
+                key, value = OPT_IN_LABEL.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                return bool(key) and labels.get(key) == value
+            key = OPT_IN_LABEL.strip()
+            return bool(key) and key in labels
+        want = set(parse_csv(OPT_IN_TAGS))
+        if not want:
+            return False
+        for key in labels:
+            if str(key).strip() in want:
+                return True
+        return False
+
+    def tag_opt_in(tags):
+        want = set(parse_csv(OPT_IN_TAGS))
+        if not want:
+            return False
+        for tag in tags or []:
+            if str(tag).strip() in want:
+                return True
+        return False
+
+    def slugify(value):
+        text = str(value or "").strip()
+        text = re.sub(r"[^A-Za-z0-9_]+", "_", text)
+        text = text.strip("_").lower()
+        if not text or text[0].isdigit():
+            text = f"api_{text}"
+        return text
+
+    def unique_name(base, existing):
+        name = base
+        index = 1
+        while name in existing:
+            index += 1
+            name = f"{base}_{index}"
+        existing.add(name)
+        return name
+
+    def list_apis():
+        paths = [
+            f"/v2/organizations/{GRAVITEE_ORG}/environments/{GRAVITEE_ENV}/apis?size=1000",
+            f"/organizations/{GRAVITEE_ORG}/environments/{GRAVITEE_ENV}/apis?size=1000",
+        ]
+        for path in paths:
+            try:
+                body = gravitee_request("GET", path)
+                data = json.loads(body.decode("utf-8") or "[]")
+                if isinstance(data, dict) and "data" in data:
+                    return data.get("data") or []
+                if isinstance(data, dict) and "items" in data:
+                    return data.get("items") or []
+                if isinstance(data, list):
+                    return data
+            except urllib.error.HTTPError as exc:
+                if exc.code in (404, 405):
+                    continue
+                raise
+        return []
+
+    def list_pages(api_id):
+        paths = [
+            f"/v2/organizations/{GRAVITEE_ORG}/environments/{GRAVITEE_ENV}/apis/{api_id}/pages?size=200",
+            f"/organizations/{GRAVITEE_ORG}/environments/{GRAVITEE_ENV}/apis/{api_id}/pages",
+        ]
+        for path in paths:
+            try:
+                body = gravitee_request("GET", path)
+                data = json.loads(body.decode("utf-8") or "[]")
+                if isinstance(data, dict) and "data" in data:
+                    return data.get("data") or []
+                if isinstance(data, dict) and "items" in data:
+                    return data.get("items") or []
+                if isinstance(data, list):
+                    return data
+            except urllib.error.HTTPError as exc:
+                if exc.code in (404, 405):
+                    continue
+                raise
+        return []
+
+    def extract_context_path(api):
+        for key in ("contextPath", "context_path"):
+            value = api.get(key)
+            if value:
+                return str(value)
+        listeners = api.get("listeners") or []
+        for listener in listeners:
+            for path in listener.get("paths") or []:
+                path_value = path.get("path")
+                if path_value:
+                    return str(path_value)
+        return ""
+
+    def build_endpoint_from_context(api, api_id):
+        context_path = extract_context_path(api)
+        if not context_path and api_id:
+            detail = get_api_detail(api_id)
+            context_path = extract_context_path(detail)
+        if not context_path:
+            return ""
+        if not context_path.startswith("/"):
+            context_path = f"/{context_path}"
+        return f"{GRAVITEE_GATEWAY_URL}{context_path}"
+
+    def fetch_url(url):
+        headers = {"Accept": "application/json, */*"}
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        with urlopen(req, timeout=30) as resp:
+            return resp.read().decode("utf-8")
+
+    def fetch_page_content(api_id, page):
+        content = page.get("content")
+        if content:
+            return content
+        source = page.get("source") or {}
+        config = source.get("configuration") or {}
+        url = config.get("url")
+        if url:
+            return fetch_url(url)
+        page_id = page.get("id")
+        if not page_id:
+            return ""
+        detail_paths = [
+            f"/v2/organizations/{GRAVITEE_ORG}/environments/{GRAVITEE_ENV}/apis/{api_id}/pages/{page_id}",
+            f"/organizations/{GRAVITEE_ORG}/environments/{GRAVITEE_ENV}/apis/{api_id}/pages/{page_id}",
+        ]
+        for path in detail_paths:
+            try:
+                body = gravitee_request("GET", path)
+                data = json.loads(body.decode("utf-8") or "{}")
+                content = data.get("content")
+                if content:
+                    return content
+                source = data.get("source") or {}
+                config = source.get("configuration") or {}
+                url = config.get("url")
+                if url:
+                    return fetch_url(url)
+            except urllib.error.HTTPError as exc:
+                if exc.code in (404, 405):
+                    continue
+                raise
+        content_paths = [
+            f"/v2/organizations/{GRAVITEE_ORG}/environments/{GRAVITEE_ENV}/apis/{api_id}/pages/{page_id}/content",
+            f"/organizations/{GRAVITEE_ORG}/environments/{GRAVITEE_ENV}/apis/{api_id}/pages/{page_id}/content",
+        ]
+        for path in content_paths:
+            try:
+                body = gravitee_request("GET", path, accept="*/*")
+                text = body.decode("utf-8").strip()
+                if text:
+                    return text
+            except urllib.error.HTTPError as exc:
+                if exc.code in (404, 405):
+                    continue
+                raise
+        return ""
+
+    def parse_openapi(text):
+        if not text:
+            return None
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            try:
+                import yaml  # type: ignore
+            except Exception:
+                log("OpenAPI payload is not JSON and PyYAML is unavailable")
+                return None
+            try:
+                return yaml.safe_load(text)
+            except Exception as exc:
+                log(f"Failed to parse OpenAPI payload: {exc}")
+                return None
+
+    def find_openapi_spec(api_id):
+        pages = list_pages(api_id)
+        for page in pages:
+            page_type = str(page.get("type", "")).upper()
+            if page_type not in OPENAPI_PAGE_TYPES:
+                continue
+            content = fetch_page_content(api_id, page)
+            spec = parse_openapi(content)
+            if spec:
+                return spec
+        return None
+
+    def build_actions(api, endpoint, spec, existing_names):
+        actions = []
+        mapping = {}
+        paths = spec.get("paths") or {}
+        api_name = api.get("name") or api.get("id") or "api"
+        api_slug = slugify(api_name)
+        api_id = api.get("id") or api.get("_id") or api_name
+        for path, methods in paths.items():
+            if not isinstance(methods, dict):
+                continue
+            for method, details in methods.items():
+                method_lower = str(method).lower()
+                if method_lower not in ("get", "post", "put", "patch", "delete", "head", "options"):
+                    continue
+                op_id = ""
+                if isinstance(details, dict):
+                    op_id = details.get("operationId") or ""
+                if not op_id:
+                    op_id = f"{method_lower}_{path}"
+                action_base = slugify(op_id)
+                action_name = unique_name(f"gravitee_{api_slug}_{action_base}", existing_names)
+                actions.append({
+                    "name": action_name,
+                    "definition": {
+                        "kind": "synchronous",
+                        "handler": ACTION_HANDLER_URL,
+                        "timeout": ACTION_TIMEOUT_SECONDS,
+                        "forward_client_headers": True,
+                        "arguments": [{"name": "input", "type": "json"}],
+                        "output_type": "json",
+                    },
+                    "comment": f"{MANAGED_COMMENT} api={api_id} method={method_lower} path={path}",
+                })
+                mapping[action_name] = {
+                    "method": method_lower.upper(),
+                    "path": path,
+                    "base_url": endpoint.rstrip("/"),
+                }
+        return actions, mapping
+
+    def build_remote_schema(api, endpoint, existing_names):
+        api_name = api.get("name") or api.get("id") or "api"
+        api_slug = slugify(api_name)
+        api_id = api.get("id") or api.get("_id") or api_name
+        name = unique_name(f"gravitee_{api_slug}", existing_names)
+        schema = {
+            "name": name,
+            "definition": {
+                "url": endpoint,
+                "timeout_seconds": REMOTE_SCHEMA_TIMEOUT_SECONDS,
+                "forward_client_headers": True,
+            },
+            "comment": f"{MANAGED_COMMENT} api={api_id}",
+        }
+        return schema
+
+    def merge_metadata(metadata, actions, remote_schemas):
+        metadata = dict(metadata or {})
+        existing_actions = metadata.get("actions") or []
+        kept_actions = [action for action in existing_actions if MANAGED_COMMENT not in str(action.get("comment", ""))]
+        metadata["actions"] = kept_actions + actions
+
+        existing_remotes = metadata.get("remote_schemas") or []
+        kept_remotes = [remote for remote in existing_remotes if MANAGED_COMMENT not in str(remote.get("comment", ""))]
+        metadata["remote_schemas"] = kept_remotes + remote_schemas
+
+        custom_types = metadata.get("custom_types") or {}
+        scalars = custom_types.get("scalars") or []
+        if not any(item.get("name") == "json" for item in scalars if isinstance(item, dict)):
+            scalars.append({"name": "json"})
+        custom_types["scalars"] = scalars
+        metadata["custom_types"] = custom_types
+        return metadata
+
+    def sync_once():
+        if not SYNC_LOCK.acquire(blocking=False):
+            return
+        try:
+            apis = list_apis()
+            actions = []
+            remotes = []
+            action_mapping = {}
+            existing_names = set()
+            for api in apis:
+                labels = parse_label_map(api)
+                tags = api.get("tags") or []
+                if not (tag_opt_in(tags) or label_opt_in(labels)):
+                    continue
+                api_id = api_id_of(api)
+                endpoint = labels.get(ENDPOINT_LABEL_KEY) or build_endpoint_from_context(api, api_id)
+                if not endpoint:
+                    api_name = api.get("name") or api.get("id") or "api"
+                    log(f"Skipping {api_name}: missing {ENDPOINT_LABEL_KEY} label or context path")
+                    continue
+                mode = labels.get(MODE_LABEL_KEY, "").lower()
+                if mode == "graphql":
+                    remotes.append(build_remote_schema(api, endpoint, existing_names))
+                    continue
+                spec = find_openapi_spec(api_id)
+                if spec:
+                    new_actions, mapping = build_actions(api, endpoint, spec, existing_names)
+                    actions.extend(new_actions)
+                    action_mapping.update(mapping)
+                    continue
+                if mode == "openapi":
+                    api_name = api.get("name") or api.get("id") or "api"
+                    log(f"Skipping {api_name}: hasura.mode=openapi but no OpenAPI spec found")
+                    continue
+                remotes.append(build_remote_schema(api, endpoint, existing_names))
+
+            if not actions and not remotes:
+                log("No Gravitee APIs matched for sync")
+                return
+
+            current = hasura_request({"type": "export_metadata", "args": {}})
+            merged = merge_metadata(current, actions, remotes)
+            hasura_request({"type": "replace_metadata", "args": merged})
+
+            with ACTION_LOCK:
+                ACTION_MAP.clear()
+                ACTION_MAP.update(action_mapping)
+            log(f"Sync complete: actions={len(actions)} remote_schemas={len(remotes)}")
+        except Exception as exc:
+            log(f"sync error: {exc}")
+        finally:
+            SYNC_LOCK.release()
+
+    def schedule_loop():
+        if SYNC_INTERVAL <= 0:
+            return
+        while True:
+            time.sleep(SYNC_INTERVAL)
+            sync_once()
+
+    def build_action_url(path_template, input_data):
+        path_params = {}
+        if isinstance(input_data, dict):
+            path_params = input_data.get("path") or {}
+        def replace(match):
+            key = match.group(1)
+            if key in path_params:
+                return str(path_params[key])
+            if isinstance(input_data, dict) and key in input_data:
+                return str(input_data[key])
+            return match.group(0)
+        path = re.sub(r"{([^}]+)}", replace, path_template)
+        if re.search(r"{[^}]+}", path):
+            raise ValueError("missing path parameters")
+        return path
+
+    def extract_body(input_data):
+        if not isinstance(input_data, dict):
+            return input_data
+        if "body" in input_data:
+            return input_data.get("body")
+        reserved = {"path", "query", "query_params", "headers"}
+        remaining = {k: v for k, v in input_data.items() if k not in reserved}
+        return remaining or None
+
+    def extract_query(input_data):
+        if not isinstance(input_data, dict):
+            return {}
+        return input_data.get("query") or input_data.get("query_params") or {}
+
+    def extract_headers(input_data):
+        if not isinstance(input_data, dict):
+            return {}
+        headers = input_data.get("headers") or {}
+        return headers if isinstance(headers, dict) else {}
+
+    def handle_action(action_name, input_data, auth_header):
+        with ACTION_LOCK:
+            entry = ACTION_MAP.get(action_name)
+        if not entry:
+            raise ValueError("action not mapped")
+        base_url = entry["base_url"].rstrip("/")
+        path = build_action_url(entry["path"], input_data)
+        url = f"{base_url}{path}"
+        query = extract_query(input_data)
+        if query:
+            url = f"{url}?{urllib.parse.urlencode(query, doseq=True)}"
+        headers = {"Accept": "application/json"}
+        if auth_header:
+            headers["Authorization"] = auth_header
+        headers.update(extract_headers(input_data))
+        body = extract_body(input_data)
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=data, headers=headers, method=entry["method"])
+        with urlopen(req, timeout=ACTION_TIMEOUT_SECONDS) as resp:
+            raw = resp.read().decode("utf-8")
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return {"raw": raw}
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            return
+
+        def do_GET(self):
+            if self.path == "/healthz":
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+                return
+            self.send_response(404)
+            self.end_headers()
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length) if length else b""
+            if self.path.startswith("/webhook"):
+                secret = read_file(WEBHOOK_SECRET_PATH)
+                if secret:
+                    token = self.headers.get("X-Webhook-Token", "") or self.headers.get("X-Gravitee-Token", "")
+                    if token != secret:
+                        self.send_response(403)
+                        self.end_headers()
+                        return
+                threading.Thread(target=sync_once, daemon=True).start()
+                self.send_response(202)
+                self.end_headers()
+                return
+            if self.path.startswith("/action"):
+                try:
+                    payload = json.loads(body.decode("utf-8") or "{}")
+                    action_name = payload.get("action", {}).get("name")
+                    input_data = payload.get("input") or {}
+                    auth_header = self.headers.get("Authorization")
+                    if not action_name:
+                        raise ValueError("missing action name")
+                    result = handle_action(action_name, input_data, auth_header)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps(result).encode("utf-8"))
+                except Exception as exc:
+                    self.send_response(502)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": str(exc)}).encode("utf-8"))
+                return
+            self.send_response(404)
+            self.end_headers()
+
+    def main():
+        log("Starting Gravitee → Hasura syncer")
+        sync_once()
+        threading.Thread(target=schedule_loop, daemon=True).start()
+        server = ThreadingHTTPServer(("0.0.0.0", 8080), Handler)
+        server.serve_forever()
+
+    if __name__ == "__main__":
+        main()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: graphql-gravitee-sync
+  namespace: graphql
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: graphql-gravitee-sync
+  template:
+    metadata:
+      labels:
+        app: graphql-gravitee-sync
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "graphql-gravitee-sync"
+        vault.hashicorp.com/agent-inject-secret-hasura-admin: "secret/data/graphql/hasura-admin"
+        vault.hashicorp.com/agent-inject-template-hasura-admin: |
+          {{- with secret "secret/data/graphql/hasura-admin" -}}
+          {{- if .Data.data.value -}}
+          {{ .Data.data.value }}
+          {{- else -}}
+          {{ .Data.data.admin_secret }}
+          {{- end -}}
+          {{- end }}
+        vault.hashicorp.com/agent-inject-secret-gravitee-admin-username: "secret/data/graphql/gravitee-admin-username"
+        vault.hashicorp.com/agent-inject-template-gravitee-admin-username: |
+          {{- with secret "secret/data/graphql/gravitee-admin-username" -}}
+          {{ .Data.data.value }}
+          {{- end }}
+        vault.hashicorp.com/agent-inject-secret-gravitee-admin-password: "secret/data/graphql/gravitee-admin-password"
+        vault.hashicorp.com/agent-inject-template-gravitee-admin-password: |
+          {{- with secret "secret/data/graphql/gravitee-admin-password" -}}
+          {{ .Data.data.value }}
+          {{- end }}
+        vault.hashicorp.com/agent-inject-secret-gravitee-webhook-secret: "secret/data/graphql/gravitee-webhook-secret"
+        vault.hashicorp.com/agent-inject-template-gravitee-webhook-secret: |
+          {{- with secret "secret/data/graphql/gravitee-webhook-secret" -}}
+          {{ .Data.data.value }}
+          {{- end }}
+        linkerd.io/inject: "enabled"
+    spec:
+      serviceAccountName: graphql-gravitee-sync
+      containers:
+        - name: sync
+          image: python:3.11-slim
+          ports:
+            - containerPort: 8080
+          env:
+            - name: HASURA_URL
+              value: "http://hasura.graphql.svc.cluster.local:8080"
+            - name: HASURA_ADMIN_SECRET_PATH
+              value: "/vault/secrets/hasura-admin"
+            - name: GRAVITEE_MANAGEMENT_API
+              value: "http://gravitee-management-api.k8s-api-gateway.svc.cluster.local:8083/management"
+            - name: GRAVITEE_ORG
+              value: "DEFAULT"
+            - name: GRAVITEE_ENV
+              value: "DEFAULT"
+            - name: GRAVITEE_GATEWAY_URL
+              value: "http://gravitee-gateway.k8s-api-gateway.svc.cluster.local:8082"
+            - name: GRAVITEE_ADMIN_USERNAME_PATH
+              value: "/vault/secrets/gravitee-admin-username"
+            - name: GRAVITEE_ADMIN_PASSWORD_PATH
+              value: "/vault/secrets/gravitee-admin-password"
+            - name: WEBHOOK_SECRET_PATH
+              value: "/vault/secrets/gravitee-webhook-secret"
+            - name: HASURA_OPT_IN_TAGS
+              value: "hasura"
+            - name: HASURA_ENDPOINT_LABEL
+              value: "hasura.endpoint"
+            - name: HASURA_MODE_LABEL
+              value: "hasura.mode"
+            - name: ACTION_HANDLER_URL
+              value: "http://graphql-gravitee-sync.graphql.svc.cluster.local:8080/action"
+            - name: SYNC_INTERVAL
+              value: "300"
+            - name: ACTION_TIMEOUT_SECONDS
+              value: "30"
+            - name: REMOTE_SCHEMA_TIMEOUT_SECONDS
+              value: "60"
+          volumeMounts:
+            - name: script
+              mountPath: /app
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              set -euo pipefail
+              python /app/sync.py
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+      volumes:
+        - name: script
+          configMap:
+            name: graphql-gravitee-sync
+            defaultMode: 0755
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: graphql-gravitee-sync
+  namespace: graphql
+spec:
+  selector:
+    app: graphql-gravitee-sync
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080

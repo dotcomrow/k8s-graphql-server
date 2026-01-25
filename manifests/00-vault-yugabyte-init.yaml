@@ -370,6 +370,19 @@ spec:
                 policies="graphql-console" \
                 ttl="48h"
 
+              vault policy write "graphql-gravitee-sync" - <<'EOF'
+              path "secret/data/graphql/hasura-admin" { capabilities = ["read"] }
+              path "secret/data/graphql/gravitee-admin-username" { capabilities = ["read"] }
+              path "secret/data/graphql/gravitee-admin-password" { capabilities = ["read"] }
+              path "secret/data/graphql/gravitee-webhook-secret" { capabilities = ["read"] }
+              EOF
+
+              vault write auth/${AUTH_PATH}/role/graphql-gravitee-sync \
+                bound_service_account_names="graphql-gravitee-sync" \
+                bound_service_account_namespaces="graphql" \
+                policies="graphql-gravitee-sync" \
+                ttl="48h"
+
               CREDS_JSON="$(vault read -format=json ${DB_MOUNT}/static-creds/${ROLE_STATIC_ADMIN})"
               DB_USER="$(printf '%s' "$CREDS_JSON" | jq -r .data.username)"
               DB_PASS="$(printf '%s' "$CREDS_JSON" | jq -r .data.password)"

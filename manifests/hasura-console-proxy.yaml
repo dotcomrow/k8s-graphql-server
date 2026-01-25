@@ -44,8 +44,11 @@ spec:
             - --provider=oidc
             - --oidc-issuer-url=https://auth.suncoast.systems/realms/internal
             - --redirect-url=https://graphql-gui.teleport.app.suncoast.systems/oauth2/callback
+            - --whitelist-domain=graphql-gui.teleport.app.suncoast.systems
+            - --cookie-domain=graphql-gui.teleport.app.suncoast.systems
             - --upstream=http://hasura.graphql.svc.cluster.local:8080
             - --email-domain=*
+            - --insecure-oidc-allow-unverified-email=true
             - --scope=openid profile email groups
             - --allowed-group=dotcomrow:hasura_admins
             - --pass-access-token=true

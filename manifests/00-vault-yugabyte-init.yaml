@@ -361,6 +361,7 @@ spec:
               path "secret/data/keycloak-client-id-hasura-console-proxy" { capabilities = ["read"] }
               path "secret/data/keycloak-client-secret-hasura-console-proxy" { capabilities = ["read"] }
               path "secret/data/hasura-console-oauth2-proxy-cookie-secret" { capabilities = ["read"] }
+              path "secret/data/graphql/hasura-admin" { capabilities = ["read"] }
               EOF
 
               vault write auth/${AUTH_PATH}/role/graphql-console \

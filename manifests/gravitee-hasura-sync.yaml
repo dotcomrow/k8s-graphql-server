@@ -594,6 +594,19 @@ data:
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
                     self.wfile.write(json.dumps(result).encode("utf-8"))
+                except urllib.error.HTTPError as exc:
+                    self.send_response(exc.code)
+                    content_type = exc.headers.get("Content-Type", "application/json")
+                    self.send_header("Content-Type", content_type)
+                    www_auth = exc.headers.get("WWW-Authenticate")
+                    if www_auth:
+                        self.send_header("WWW-Authenticate", www_auth)
+                    self.end_headers()
+                    payload = exc.read()
+                    if payload:
+                        self.wfile.write(payload)
+                    else:
+                        self.wfile.write(json.dumps({"error": str(exc)}).encode("utf-8"))
                 except Exception as exc:
                     self.send_response(502)
                     self.send_header("Content-Type", "application/json")

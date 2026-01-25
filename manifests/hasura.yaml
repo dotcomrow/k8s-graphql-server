@@ -32,6 +32,11 @@ spec:
           {{- with secret "yugabyte-db/static-creds/graphql-yb-admin" -}}
           postgresql://{{ .Data.username }}:{{ .Data.password }}@yb-tserver-service.yugabyte.svc.cluster.local:5433/hasura?sslmode=disable
           {{- end }}
+        vault.hashicorp.com/agent-inject-secret-graphql-api-client-id: "secret/data/keycloak-client-id-graphql-api"
+        vault.hashicorp.com/agent-inject-template-graphql-api-client-id: |
+          {{- with secret "secret/data/keycloak-client-id-graphql-api" -}}
+          {{ .Data.data.value }}
+          {{- end }}
         linkerd.io/inject: "enabled"
     spec:
       serviceAccountName: hasura
@@ -47,8 +52,6 @@ spec:
               value: "false"
             - name: HASURA_GRAPHQL_ENABLED_LOG_TYPES
               value: "startup, http-log, websocket-log, query-log"
-            - name: HASURA_GRAPHQL_JWT_SECRETS
-              value: '[{"type":"RS256","jwk_url":"https://auth.suncoast.systems/realms/internal/protocol/openid-connect/certs","issuer":"https://auth.suncoast.systems/realms/internal","audience":"hasura-console-proxy","claims_namespace_path":"$[\"https://hasura\"][\"io/jwt/claims\"]"},{"type":"RS256","jwk_url":"https://auth.suncoast.systems/realms/external/protocol/openid-connect/certs","issuer":"https://auth.suncoast.systems/realms/external","claims_namespace_path":"$[\"https://hasura\"][\"io/jwt/claims\"]"}]'
           command: ["/bin/sh","-c"]
           args:
             - |
@@ -62,10 +65,30 @@ spec:
               }
               wait_for_file /vault/secrets/db-url
               wait_for_file /vault/secrets/hasura-admin
+              wait_for_file /vault/secrets/graphql-api-client-id
 
               read_secrets() {
                 db="$(cat /vault/secrets/db-url)"
                 admin="$(cat /vault/secrets/hasura-admin)"
+                graphql_aud="$(tr -d '\r\n' < /vault/secrets/graphql-api-client-id)"
+                if [ -z "${graphql_aud:-}" ]; then
+                  echo "graphql api client id is empty"
+                  exit 1
+                fi
+              }
+
+              build_jwt_secrets() {
+                internal_jwk="https://auth.suncoast.systems/realms/internal/protocol/openid-connect/certs"
+                internal_issuer="https://auth.suncoast.systems/realms/internal"
+                internal_aud="hasura-console-proxy"
+                external_jwk="https://auth.suncoast.systems/realms/external/protocol/openid-connect/certs"
+                external_issuer="https://auth.suncoast.systems/realms/external"
+                claims_path='$["https://hasura"]["io/jwt/claims"]'
+                internal_json=$(printf '{"type":"RS256","jwk_url":"%s","issuer":"%s","audience":"%s","claims_namespace_path":"%s"}' \
+                  "$internal_jwk" "$internal_issuer" "$internal_aud" "$claims_path")
+                external_json=$(printf '{"type":"RS256","jwk_url":"%s","issuer":"%s","audience":"%s","claims_namespace_path":"%s"}' \
+                  "$external_jwk" "$external_issuer" "$graphql_aud" "$claims_path")
+                export HASURA_GRAPHQL_JWT_SECRETS="[$internal_json,$external_json]"
               }
 
               start_hasura() {
@@ -76,17 +99,21 @@ spec:
               read_secrets
               last_db="$db"
               last_admin="$admin"
+              last_graphql_aud="$graphql_aud"
               export HASURA_GRAPHQL_DATABASE_URL="$last_db"
               export HASURA_GRAPHQL_ADMIN_SECRET="$last_admin"
+              build_jwt_secrets
               start_hasura
 
               while :; do
                 read_secrets
-                if [ "$db" != "$last_db" ] || [ "$admin" != "$last_admin" ]; then
+                if [ "$db" != "$last_db" ] || [ "$admin" != "$last_admin" ] || [ "$graphql_aud" != "$last_graphql_aud" ]; then
                   last_db="$db"
                   last_admin="$admin"
+                  last_graphql_aud="$graphql_aud"
                   export HASURA_GRAPHQL_DATABASE_URL="$last_db"
                   export HASURA_GRAPHQL_ADMIN_SECRET="$last_admin"
+                  build_jwt_secrets
                   if kill -0 "$HASURA_PID" 2>/dev/null; then
                     kill -TERM "$HASURA_PID"
                     wait "$HASURA_PID" || true

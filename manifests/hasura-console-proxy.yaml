@@ -4,6 +4,34 @@ metadata:
   name: hasura-console-proxy
   namespace: graphql
 ---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hasura-console-nginx
+  namespace: graphql
+data:
+  hasura-console.conf.template: |
+    map $http_upgrade $connection_upgrade {
+      default upgrade;
+      '' close;
+    }
+
+    server {
+      listen 8081;
+      server_name _;
+      location / {
+        proxy_pass http://hasura.graphql.svc.cluster.local:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header X-Hasura-Admin-Secret ${HASURA_ADMIN_SECRET};
+      }
+    }
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -32,6 +60,15 @@ spec:
           {{ with secret "secret/data/hasura-console-oauth2-proxy-cookie-secret" }}
           cookie_secret = "{{ .Data.data.value }}"
           {{ end }}
+        vault.hashicorp.com/agent-inject-secret-hasura-admin: "secret/data/graphql/hasura-admin"
+        vault.hashicorp.com/agent-inject-template-hasura-admin: |
+          {{- with secret "secret/data/graphql/hasura-admin" -}}
+          {{- if .Data.data.admin_secret -}}
+          {{ .Data.data.admin_secret }}
+          {{- else -}}
+          {{ .Data.data.value }}
+          {{- end -}}
+          {{- end -}}
     spec:
       serviceAccountName: hasura-console-proxy
       containers:
@@ -47,7 +84,7 @@ spec:
             - --whitelist-domain=graphql-gui.teleport.app.suncoast.systems
             - --whitelist-domain=teleport.app.suncoast.systems
             - --cookie-domain=.teleport.app.suncoast.systems
-            - --upstream=http://hasura.graphql.svc.cluster.local:8080
+            - --upstream=http://127.0.0.1:8081
             - --email-domain=*
             - --insecure-oidc-allow-unverified-email=true
             - --scope=openid profile email groups
@@ -75,6 +112,26 @@ spec:
               port: 4180
             initialDelaySeconds: 15
             periodSeconds: 20
+        - name: hasura-console-upstream
+          image: nginx:1.27-alpine
+          ports:
+            - containerPort: 8081
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              set -eu
+              secret="$(cat /vault/secrets/hasura-admin)"
+              escaped="$(printf '%s' "$secret" | sed 's/[$]/\\$&/g')"
+              export HASURA_ADMIN_SECRET="$escaped"
+              envsubst '$HASURA_ADMIN_SECRET' < /etc/nginx/templates/hasura-console.conf.template > /etc/nginx/conf.d/default.conf
+              exec nginx -g 'daemon off;'
+          volumeMounts:
+            - name: hasura-console-nginx
+              mountPath: /etc/nginx/templates
+      volumes:
+        - name: hasura-console-nginx
+          configMap:
+            name: hasura-console-nginx
 ---
 apiVersion: v1
 kind: Service

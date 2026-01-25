@@ -84,10 +84,14 @@ spec:
                 external_jwk="https://auth.suncoast.systems/realms/external/protocol/openid-connect/certs"
                 external_issuer="https://auth.suncoast.systems/realms/external"
                 claims_path='$["https://hasura"]["io/jwt/claims"]'
+                json_escape() {
+                  printf '%s' "$1" | sed 's/\\/\\\\/g; s/\"/\\\"/g'
+                }
+                claims_path_escaped="$(json_escape "$claims_path")"
                 internal_json=$(printf '{"type":"RS256","jwk_url":"%s","issuer":"%s","audience":"%s","claims_namespace_path":"%s"}' \
-                  "$internal_jwk" "$internal_issuer" "$internal_aud" "$claims_path")
+                  "$internal_jwk" "$internal_issuer" "$internal_aud" "$claims_path_escaped")
                 external_json=$(printf '{"type":"RS256","jwk_url":"%s","issuer":"%s","audience":"%s","claims_namespace_path":"%s"}' \
-                  "$external_jwk" "$external_issuer" "$graphql_aud" "$claims_path")
+                  "$external_jwk" "$external_issuer" "$graphql_aud" "$claims_path_escaped")
                 export HASURA_GRAPHQL_JWT_SECRETS="[$internal_json,$external_json]"
               }
 

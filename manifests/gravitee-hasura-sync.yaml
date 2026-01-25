@@ -155,6 +155,8 @@ data:
             return []
         return [item.strip() for item in value.split(",") if item.strip()]
 
+    ACTION_ALLOWED_ROLES = parse_csv(os.environ.get("HASURA_ACTION_ROLES", "user"))
+
     def label_opt_in(labels):
         if OPT_IN_LABEL:
             if "=" in OPT_IN_LABEL:
@@ -378,6 +380,7 @@ data:
                         "arguments": [{"name": "input", "type": "json"}],
                         "output_type": "json",
                     },
+                    "permissions": [{"role": role} for role in ACTION_ALLOWED_ROLES],
                     "comment": f"{MANAGED_COMMENT} api={api_id} method={method_lower} path={path}",
                 })
                 mapping[action_name] = {

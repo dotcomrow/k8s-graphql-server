@@ -581,6 +581,12 @@ data:
                     action_name = payload.get("action", {}).get("name")
                     input_data = payload.get("input") or {}
                     auth_header = self.headers.get("Authorization")
+                    xfwd_token = self.headers.get("X-Forwarded-Access-Token")
+                    if xfwd_token:
+                        token = xfwd_token.strip()
+                        if token and not token.lower().startswith("bearer "):
+                            token = f"Bearer {token}"
+                        auth_header = token
                     if not action_name:
                         raise ValueError("missing action name")
                     result = handle_action(action_name, input_data, auth_header)

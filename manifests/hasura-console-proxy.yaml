@@ -41,7 +41,7 @@ spec:
             - containerPort: 4180
           args:
             - --config=/vault/secrets/oauth2.cfg
-            - --provider=oidc
+            - --provider=keycloak-oidc
             - --oidc-issuer-url=https://auth.suncoast.systems/realms/internal
             - --redirect-url=https://graphql-gui.teleport.app.suncoast.systems/oauth2/callback
             - --whitelist-domain=graphql-gui.teleport.app.suncoast.systems
@@ -51,7 +51,7 @@ spec:
             - --email-domain=*
             - --insecure-oidc-allow-unverified-email=true
             - --scope=openid profile email groups
-            - --allowed-group=dotcomrow:hasura_admins
+            - --allowed-role=hasura_admins
             - --pass-access-token=true
             - --set-authorization-header=true
             - --pass-authorization-header=true

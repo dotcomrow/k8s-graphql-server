@@ -372,9 +372,8 @@ spec:
 
               vault policy write "graphql-gravitee-sync" - <<'EOF'
               path "secret/data/graphql/hasura-admin" { capabilities = ["read"] }
-              path "secret/data/graphql/gravitee-admin-username" { capabilities = ["read"] }
-              path "secret/data/graphql/gravitee-admin-password" { capabilities = ["read"] }
-              path "secret/data/graphql/gravitee-webhook-secret" { capabilities = ["read"] }
+              path "secret/data/gravitee/admin-credentials" { capabilities = ["read"] }
+              path "secret/data/gravitee-webhook-secret" { capabilities = ["read"] }
               EOF
 
               vault write auth/${AUTH_PATH}/role/graphql-gravitee-sync \

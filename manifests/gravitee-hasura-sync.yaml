@@ -633,19 +633,19 @@ spec:
           {{ .Data.data.admin_secret }}
           {{- end -}}
           {{- end }}
-        vault.hashicorp.com/agent-inject-secret-gravitee-admin-username: "secret/data/graphql/gravitee-admin-username"
+        vault.hashicorp.com/agent-inject-secret-gravitee-admin-username: "secret/data/gravitee/admin-credentials"
         vault.hashicorp.com/agent-inject-template-gravitee-admin-username: |
-          {{- with secret "secret/data/graphql/gravitee-admin-username" -}}
-          {{ .Data.data.value }}
+          {{- with secret "secret/data/gravitee/admin-credentials" -}}
+          {{ .Data.data.username }}
           {{- end }}
-        vault.hashicorp.com/agent-inject-secret-gravitee-admin-password: "secret/data/graphql/gravitee-admin-password"
+        vault.hashicorp.com/agent-inject-secret-gravitee-admin-password: "secret/data/gravitee/admin-credentials"
         vault.hashicorp.com/agent-inject-template-gravitee-admin-password: |
-          {{- with secret "secret/data/graphql/gravitee-admin-password" -}}
-          {{ .Data.data.value }}
+          {{- with secret "secret/data/gravitee/admin-credentials" -}}
+          {{ .Data.data.password }}
           {{- end }}
-        vault.hashicorp.com/agent-inject-secret-gravitee-webhook-secret: "secret/data/graphql/gravitee-webhook-secret"
+        vault.hashicorp.com/agent-inject-secret-gravitee-webhook-secret: "secret/data/gravitee-webhook-secret"
         vault.hashicorp.com/agent-inject-template-gravitee-webhook-secret: |
-          {{- with secret "secret/data/graphql/gravitee-webhook-secret" -}}
+          {{- with secret "secret/data/gravitee-webhook-secret" -}}
           {{ .Data.data.value }}
           {{- end }}
         linkerd.io/inject: "enabled"

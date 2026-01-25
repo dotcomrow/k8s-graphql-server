@@ -19,6 +19,7 @@ spec:
       labels:
         app: hasura
       annotations:
+        reloader.stakater.com/auto: "true"
         vault.hashicorp.com/agent-inject: "true"
         vault.hashicorp.com/role: "graphql"
         vault.hashicorp.com/agent-inject-secret-hasura-admin: "secret/data/graphql/hasura-admin"

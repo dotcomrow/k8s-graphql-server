@@ -62,7 +62,7 @@ spec:
           {{ end }}
           {{ with secret "secret/data/redis" }}
           {{- $raw := .Data.data.password -}}
-          {{- $enc := $raw | replace "%" "%25" | replace "@" "%40" | replace ":" "%3A" | replace "/" "%2F" | replace "+" "%2B" -}}
+          {{- $enc := $raw | urlquery -}}
           redis_connection_url = "redis://:{{ $enc }}@redis-0.redis-headless.redis.svc.cluster.local:6379/0"
           {{ end }}
         vault.hashicorp.com/agent-inject-secret-hasura-admin: "secret/data/graphql/hasura-admin"

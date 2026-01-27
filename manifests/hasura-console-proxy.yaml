@@ -61,7 +61,9 @@ spec:
           cookie_secret = "{{ .Data.data.value }}"
           {{ end }}
           {{ with secret "secret/data/redis" }}
-          redis_connection_url = "redis://:{{ .Data.data.password }}@redis-0.redis-headless.redis.svc.cluster.local:6379/0"
+          {{- $raw := .Data.data.password -}}
+          {{- $enc := $raw | replace "%" "%25" | replace "@" "%40" | replace ":" "%3A" | replace "/" "%2F" | replace "+" "%2B" -}}
+          redis_connection_url = "redis://:{{ $enc }}@redis-0.redis-headless.redis.svc.cluster.local:6379/0"
           {{ end }}
         vault.hashicorp.com/agent-inject-secret-hasura-admin: "secret/data/graphql/hasura-admin"
         vault.hashicorp.com/agent-inject-template-hasura-admin: |

@@ -60,6 +60,9 @@ spec:
           {{ with secret "secret/data/hasura-console-oauth2-proxy-cookie-secret" }}
           cookie_secret = "{{ .Data.data.value }}"
           {{ end }}
+          {{ with secret "secret/data/redis" }}
+          redis_connection_url = "redis://:{{ .Data.data.password }}@redis-0.redis-headless.redis.svc.cluster.local:6379/0"
+          {{ end }}
         vault.hashicorp.com/agent-inject-secret-hasura-admin: "secret/data/graphql/hasura-admin"
         vault.hashicorp.com/agent-inject-template-hasura-admin: |
           {{- with secret "secret/data/graphql/hasura-admin" -}}
@@ -69,11 +72,6 @@ spec:
           {{ .Data.data.value }}
           {{- end -}}
           {{- end -}}
-        vault.hashicorp.com/agent-inject-secret-redis-creds: "secret/data/redis"
-        vault.hashicorp.com/agent-inject-template-redis-creds: |
-          {{- with secret "secret/data/redis" -}}
-          export REDIS_PASSWORD="{{ .Data.data.password }}"
-          {{- end -}}
     spec:
       serviceAccountName: hasura-console-proxy
       containers:
@@ -81,46 +79,31 @@ spec:
           image: quay.io/oauth2-proxy/oauth2-proxy:v7.6.0
           ports:
             - containerPort: 4180
-          env:
-            - name: REDIS_ENABLED
-              value: "true"
-            - name: REDIS_HOST
-              value: "redis-0.redis-headless.redis.svc.cluster.local"
-            - name: REDIS_PORT
-              value: "6379"
-          command: ["/bin/sh", "-c"]
           args:
-            - |
-              set -eu
-              if [ -f /vault/secrets/redis-creds ]; then
-                . /vault/secrets/redis-creds
-              fi
-              exec /oauth2-proxy \
-                --config=/vault/secrets/oauth2.cfg \
-                --provider=keycloak-oidc \
-                --oidc-issuer-url=https://auth.suncoast.systems/realms/internal \
-                --redirect-url=https://graphql-gui.teleport.app.suncoast.systems/oauth2/callback \
-                --whitelist-domain=graphql-gui.teleport.app.suncoast.systems \
-                --whitelist-domain=teleport.app.suncoast.systems \
-                --cookie-domain=.teleport.app.suncoast.systems \
-                --upstream=http://127.0.0.1:8081 \
-                --email-domain=* \
-                --insecure-oidc-allow-unverified-email=true \
-                --scope="openid profile email groups" \
-                --allowed-role=hasura_admins \
-                --pass-access-token=true \
-                --set-authorization-header=true \
-                --pass-authorization-header=true \
-                --set-xauthrequest=true \
-                --proxy-websockets=true \
-                --cookie-secure=true \
-                --cookie-samesite=lax \
-                --cookie-refresh=1h \
-                --cookie-expire=8h \
-                --session-store-type=redis \
-                --redis-connection-url="redis://:${REDIS_PASSWORD}@${REDIS_HOST}:${REDIS_PORT}/0" \
-                --reverse-proxy=true \
-                --http-address=0.0.0.0:4180
+            - --config=/vault/secrets/oauth2.cfg
+            - --provider=keycloak-oidc
+            - --oidc-issuer-url=https://auth.suncoast.systems/realms/internal
+            - --redirect-url=https://graphql-gui.teleport.app.suncoast.systems/oauth2/callback
+            - --whitelist-domain=graphql-gui.teleport.app.suncoast.systems
+            - --whitelist-domain=teleport.app.suncoast.systems
+            - --cookie-domain=.teleport.app.suncoast.systems
+            - --upstream=http://127.0.0.1:8081
+            - --email-domain=*
+            - --insecure-oidc-allow-unverified-email=true
+            - --scope=openid profile email groups
+            - --allowed-role=hasura_admins
+            - --pass-access-token=true
+            - --set-authorization-header=true
+            - --pass-authorization-header=true
+            - --set-xauthrequest=true
+            - --proxy-websockets=true
+            - --cookie-secure=true
+            - --cookie-samesite=lax
+            - --cookie-refresh=1h
+            - --cookie-expire=8h
+            - --session-store-type=redis
+            - --reverse-proxy=true
+            - --http-address=0.0.0.0:4180
           readinessProbe:
             httpGet:
               path: /ping

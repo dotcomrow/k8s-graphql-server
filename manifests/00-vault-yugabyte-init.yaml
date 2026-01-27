@@ -12,12 +12,14 @@ metadata:
   annotations:
     argocd.argoproj.io/sync-options: Replace=true,Force=true
     argocd.argoproj.io/sync-wave: "-4"
+    reloader.stakater.com/auto: "true"
 spec:
   backoffLimit: 0
   template:
     metadata:
       annotations:
         linkerd.io/inject: "disabled"
+        reloader.stakater.com/auto: "true"
     spec:
       restartPolicy: Never
       serviceAccountName: graphql-vault-init
@@ -363,7 +365,8 @@ spec:
               path "secret/data/keycloak-client-secret-hasura-console-proxy" { capabilities = ["read"] }
               path "secret/data/hasura-console-oauth2-proxy-cookie-secret" { capabilities = ["read"] }
               path "secret/data/graphql/hasura-admin" { capabilities = ["read"] }
-              EOF
+              path "secret/data/redis" { capabilities = ["read"] }
+EOF
 
               vault write auth/${AUTH_PATH}/role/graphql-console \
                 bound_service_account_names="hasura-console-proxy" \

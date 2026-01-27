@@ -366,7 +366,7 @@ spec:
               path "secret/data/hasura-console-oauth2-proxy-cookie-secret" { capabilities = ["read"] }
               path "secret/data/graphql/hasura-admin" { capabilities = ["read"] }
               path "secret/data/redis" { capabilities = ["read"] }
-EOF
+              EOF
 
               vault write auth/${AUTH_PATH}/role/graphql-console \
                 bound_service_account_names="hasura-console-proxy" \

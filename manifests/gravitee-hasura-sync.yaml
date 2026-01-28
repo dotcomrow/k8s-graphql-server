@@ -592,6 +592,22 @@ data:
                         auth_header = token
                     if not action_name:
                         raise ValueError("missing action name")
+                    incoming_headers = self.headers
+                    forwarded = {
+                        "X-Forwarded-For": incoming_headers.get("X-Forwarded-For"),
+                        "X-Client-IP": incoming_headers.get("X-Client-IP"),
+                        "X-Real-IP": incoming_headers.get("X-Real-IP"),
+                        "X-Forwarded-Proto": incoming_headers.get("X-Forwarded-Proto"),
+                        "X-Forwarded-Host": incoming_headers.get("X-Forwarded-Host"),
+                    }
+                    input_headers = input_data.get("headers") if isinstance(input_data, dict) else None
+                    if not isinstance(input_headers, dict):
+                        input_headers = {}
+                    for key, value in forwarded.items():
+                        if value and key not in input_headers:
+                            input_headers[key] = value
+                    input_data["headers"] = input_headers
+                    log(f"action={action_name} xff={input_headers.get('X-Forwarded-For','')} client_ip={input_headers.get('X-Client-IP','')}")
                     result = handle_action(action_name, input_data, auth_header)
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")

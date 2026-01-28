@@ -156,6 +156,9 @@ data:
         return [item.strip() for item in value.split(",") if item.strip()]
 
     ACTION_ALLOWED_ROLES = parse_csv(os.environ.get("HASURA_ACTION_ROLES", "user"))
+    USER_ID_CLAIM = os.environ.get("USER_ID_CLAIM", "sub")
+    USER_EMAIL_CLAIM = os.environ.get("USER_EMAIL_CLAIM", "email")
+    USER_USERNAME_CLAIM = os.environ.get("USER_USERNAME_CLAIM", "preferred_username")
 
     def label_opt_in(labels):
         if OPT_IN_LABEL:
@@ -199,6 +202,40 @@ data:
             name = f"{base}_{index}"
         existing.add(name)
         return name
+
+    def extract_bearer_token(auth_header):
+        if not auth_header:
+            return ""
+        token = auth_header.strip()
+        if token.lower().startswith("bearer "):
+            token = token[7:].strip()
+        return token
+
+    def decode_jwt_payload(token):
+        parts = token.split(".")
+        if len(parts) < 2:
+            return {}
+        payload = parts[1]
+        payload += "=" * (-len(payload) % 4)
+        try:
+            decoded = base64.urlsafe_b64decode(payload.encode("utf-8"))
+            return json.loads(decoded.decode("utf-8") or "{}")
+        except Exception:
+            return {}
+
+    def extract_user_claims(auth_header):
+        token = extract_bearer_token(auth_header)
+        if not token:
+            return {}
+        claims = decode_jwt_payload(token)
+        if not isinstance(claims, dict):
+            return {}
+        return {
+            "user_id": claims.get(USER_ID_CLAIM) or claims.get("sub"),
+            "user_email": claims.get(USER_EMAIL_CLAIM) or claims.get("email"),
+            "user_username": claims.get(USER_USERNAME_CLAIM) or claims.get("preferred_username"),
+            "user_issuer": claims.get("iss"),
+        }
 
     def list_apis():
         paths = [
@@ -613,8 +650,28 @@ data:
                     for key, value in forwarded.items():
                         if value and key not in input_headers:
                             input_headers[key] = value
+                    user_claims = extract_user_claims(auth_header)
+                    if user_claims.get("user_id") and "X-User-Id" not in input_headers:
+                        input_headers["X-User-Id"] = str(user_claims["user_id"])
+                    if user_claims.get("user_email") and "X-User-Email" not in input_headers:
+                        input_headers["X-User-Email"] = str(user_claims["user_email"])
+                    if user_claims.get("user_username") and "X-User-Username" not in input_headers:
+                        input_headers["X-User-Username"] = str(user_claims["user_username"])
+                    if user_claims.get("user_issuer") and "X-User-Issuer" not in input_headers:
+                        input_headers["X-User-Issuer"] = str(user_claims["user_issuer"])
                     input_data["headers"] = input_headers
-                    log(f"action={action_name} xff={input_headers.get('X-Forwarded-For','')} client_ip={input_headers.get('X-Client-IP','')}")
+                    log(
+                        "action="
+                        + str(action_name)
+                        + " xff="
+                        + str(input_headers.get("X-Forwarded-For", ""))
+                        + " client_ip="
+                        + str(input_headers.get("X-Client-IP", ""))
+                        + " user_id="
+                        + str(user_claims.get("user_id", ""))
+                        + " user_email="
+                        + str(user_claims.get("user_email", ""))
+                    )
                     result = handle_action(action_name, input_data, auth_header)
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")

@@ -583,6 +583,13 @@ data:
                     payload = json.loads(body.decode("utf-8") or "{}")
                     action_name = payload.get("action", {}).get("name")
                     input_data = payload.get("input") or {}
+                    if (
+                        isinstance(input_data, dict)
+                        and "input" in input_data
+                        and len(input_data) == 1
+                        and isinstance(input_data.get("input"), dict)
+                    ):
+                        input_data = input_data["input"]
                     auth_header = self.headers.get("Authorization")
                     xfwd_token = self.headers.get("X-Forwarded-Access-Token")
                     if xfwd_token:

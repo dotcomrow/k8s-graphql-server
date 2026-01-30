@@ -25,7 +25,8 @@ spec:
             phase: rewrite
             functions:
               - |-
-                local tp = ngx.req.get_headers()["traceparent"] or ngx.req.get_headers()["x-traceparent"]
+                local headers = ngx.req.get_headers()
+                local tp = headers["traceparent"] or headers["x-traceparent"] or headers["x-hasura-traceparent"]
                 if not tp or tp == "" then
                   local rand = require("resty.random")
                   local str = require("resty.string")
@@ -33,9 +34,25 @@ spec:
                   local span_id = str.to_hex(rand.bytes(8))
                   tp = "00-" .. trace_id .. "-" .. span_id .. "-01"
                 end
+                local ts = headers["tracestate"] or headers["x-tracestate"]
+                local bag = headers["baggage"] or headers["x-baggage"]
                 ngx.req.set_header("traceparent", tp)
                 ngx.req.set_header("x-traceparent", tp)
                 ngx.req.set_header("x-hasura-traceparent", tp)
+                ngx.req.set_header("x-forwarded-traceparent", tp)
+                ngx.req.set_header("x-request-id", tp)
+                if ts and ts ~= "" then
+                  ngx.req.set_header("tracestate", ts)
+                  ngx.req.set_header("x-tracestate", ts)
+                  ngx.req.set_header("x-hasura-tracestate", ts)
+                  ngx.req.set_header("x-forwarded-tracestate", ts)
+                end
+                if bag and bag ~= "" then
+                  ngx.req.set_header("baggage", bag)
+                  ngx.req.set_header("x-baggage", bag)
+                  ngx.req.set_header("x-hasura-baggage", bag)
+                  ngx.req.set_header("x-forwarded-baggage", bag)
+                end
         - name: opentelemetry
           enable: true
           config:
@@ -78,16 +95,3 @@ spec:
               X-Original-Forwarded-For: "$http_x_forwarded_for"
               X-Forwarded-Proto: "$scheme"
               X-Forwarded-Host: "$host"
-              Traceparent: "$opentelemetry_context_traceparent"
-              Tracestate: "$http_tracestate"
-              Baggage: "$http_baggage"
-              X-Traceparent: "$opentelemetry_context_traceparent"
-              X-Tracestate: "$http_tracestate"
-              X-Baggage: "$http_baggage"
-              X-Hasura-Traceparent: "$opentelemetry_context_traceparent"
-              X-Hasura-Tracestate: "$http_tracestate"
-              X-Hasura-Baggage: "$http_baggage"
-              X-Forwarded-Traceparent: "$opentelemetry_context_traceparent"
-              X-Forwarded-Tracestate: "$http_tracestate"
-              X-Forwarded-Baggage: "$http_baggage"
-              X-Request-Id: "$opentelemetry_context_traceparent"

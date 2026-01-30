@@ -637,6 +637,9 @@ data:
                     if not action_name:
                         raise ValueError("missing action name")
                     incoming_headers = self.headers
+                    traceparent = incoming_headers.get("traceparent") or incoming_headers.get("Traceparent")
+                    tracestate = incoming_headers.get("tracestate") or incoming_headers.get("Tracestate")
+                    baggage = incoming_headers.get("baggage") or incoming_headers.get("Baggage")
                     forwarded = {
                         "X-Forwarded-For": incoming_headers.get("X-Forwarded-For"),
                         "X-Client-IP": incoming_headers.get("X-Client-IP"),
@@ -644,6 +647,12 @@ data:
                         "X-Forwarded-Proto": incoming_headers.get("X-Forwarded-Proto"),
                         "X-Forwarded-Host": incoming_headers.get("X-Forwarded-Host"),
                     }
+                    if traceparent:
+                        forwarded["Traceparent"] = traceparent
+                    if tracestate:
+                        forwarded["Tracestate"] = tracestate
+                    if baggage:
+                        forwarded["Baggage"] = baggage
                     input_headers = input_data.get("headers") if isinstance(input_data, dict) else None
                     if not isinstance(input_headers, dict):
                         input_headers = {}

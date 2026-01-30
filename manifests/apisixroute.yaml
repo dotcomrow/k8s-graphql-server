@@ -60,3 +60,6 @@ spec:
               X-Hasura-Traceparent: "$opentelemetry_context_traceparent"
               X-Hasura-Tracestate: "$http_tracestate"
               X-Hasura-Baggage: "$http_baggage"
+              X-Forwarded-Traceparent: "$opentelemetry_context_traceparent"
+              X-Forwarded-Tracestate: "$http_tracestate"
+              X-Forwarded-Baggage: "$http_baggage"

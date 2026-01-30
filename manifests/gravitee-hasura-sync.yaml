@@ -664,6 +664,13 @@ data:
                         request_headers_payload = normalize_request_headers(
                             payload.get("headers")
                         )
+                    if request_headers_payload:
+                        log(
+                            "action="
+                            + str(action_name)
+                            + " payload_header_keys="
+                            + ",".join(sorted([str(k) for k in request_headers_payload.keys()]))
+                        )
                     auth_header = self.headers.get("Authorization")
                     xfwd_token = self.headers.get("X-Forwarded-Access-Token")
                     if xfwd_token:

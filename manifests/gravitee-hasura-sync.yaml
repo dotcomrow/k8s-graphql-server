@@ -664,13 +664,25 @@ data:
                         request_headers_payload = normalize_request_headers(
                             payload.get("headers")
                         )
-                    if request_headers_payload:
-                        log(
-                            "action="
-                            + str(action_name)
-                            + " payload_header_keys="
-                            + ",".join(sorted([str(k) for k in request_headers_payload.keys()]))
-                        )
+                    payload_request = payload.get("request") if isinstance(payload, dict) else None
+                    request_keys = payload_request.keys() if isinstance(payload_request, dict) else []
+                    request_headers_raw = (
+                        payload_request.get("headers") if isinstance(payload_request, dict) else None
+                    )
+                    log(
+                        "action="
+                        + str(action_name)
+                        + " payload_keys="
+                        + ",".join(sorted([str(k) for k in payload.keys()]))
+                        + " request_keys="
+                        + ",".join(sorted([str(k) for k in request_keys]))
+                        + " request_headers_type="
+                        + str(type(request_headers_raw).__name__)
+                        + " request_headers_present="
+                        + str(bool(request_headers_raw))
+                        + " payload_header_keys="
+                        + ",".join(sorted([str(k) for k in request_headers_payload.keys()]))
+                    )
                     auth_header = self.headers.get("Authorization")
                     xfwd_token = self.headers.get("X-Forwarded-Access-Token")
                     if xfwd_token:

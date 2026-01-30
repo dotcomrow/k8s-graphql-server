@@ -701,6 +701,13 @@ data:
                     )
                     traceparent_from_request_id = incoming_headers.get("x-request-id") or incoming_headers.get("X-Request-Id")
                     if traceparent_from_request_id:
+                        log(
+                            "action="
+                            + str(action_name)
+                            + " x_request_id="
+                            + str(traceparent_from_request_id)
+                        )
+                    if traceparent_from_request_id:
                         traceparent_from_request_id = traceparent_from_request_id.strip()
                     session_vars = payload.get("session_variables") if isinstance(payload, dict) else None
                     if not isinstance(session_vars, dict):

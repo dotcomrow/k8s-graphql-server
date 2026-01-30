@@ -693,6 +693,12 @@ data:
                     if not action_name:
                         raise ValueError("missing action name")
                     incoming_headers = self.headers
+                    log(
+                        "action="
+                        + str(action_name)
+                        + " incoming_header_keys="
+                        + ",".join(sorted([str(k) for k in incoming_headers.keys()]))
+                    )
                     traceparent = (
                         incoming_headers.get("traceparent")
                         or incoming_headers.get("Traceparent")

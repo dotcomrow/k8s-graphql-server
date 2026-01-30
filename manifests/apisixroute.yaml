@@ -19,6 +19,23 @@ spec:
         - serviceName: hasura
           servicePort: 8080
       plugins:
+        - name: serverless-pre-function
+          enable: true
+          config:
+            phase: rewrite
+            functions:
+              - |-
+                local tp = ngx.req.get_headers()["traceparent"] or ngx.req.get_headers()["x-traceparent"]
+                if not tp or tp == "" then
+                  local rand = require("resty.random")
+                  local str = require("resty.string")
+                  local trace_id = str.to_hex(rand.bytes(16))
+                  local span_id = str.to_hex(rand.bytes(8))
+                  tp = "00-" .. trace_id .. "-" .. span_id .. "-01"
+                end
+                ngx.req.set_header("traceparent", tp)
+                ngx.req.set_header("x-traceparent", tp)
+                ngx.req.set_header("x-hasura-traceparent", tp)
         - name: opentelemetry
           enable: true
           config:

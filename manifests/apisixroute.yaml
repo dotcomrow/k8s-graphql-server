@@ -28,21 +28,29 @@ spec:
                 return function(conf, ctx)
                   local headers = ngx.req.get_headers()
                   local tp = headers["traceparent"] or headers["x-traceparent"] or headers["x-hasura-traceparent"]
-                  if not tp or tp == "" then
-                    local rand = require("resty.random")
-                    local str = require("resty.string")
-                    local trace_id = str.to_hex(rand.bytes(16))
-                    local span_id = str.to_hex(rand.bytes(8))
-                    tp = "00-" .. trace_id .. "-" .. span_id .. "-01"
-                  end
-                  local ts = headers["tracestate"] or headers["x-tracestate"]
-                  local bag = headers["baggage"] or headers["x-baggage"]
-                  ngx.req.set_header("traceparent", tp)
-                  ngx.req.set_header("x-traceparent", tp)
-                  ngx.req.set_header("x-hasura-traceparent", tp)
-                  ngx.req.set_header("x-forwarded-traceparent", tp)
-                  ngx.req.set_header("x-oo-traceparent", tp)
-                  ngx.req.set_header("x-request-id", tp)
+                if not tp or tp == "" then
+                  local rand = require("resty.random")
+                  local str = require("resty.string")
+                  local trace_id = str.to_hex(rand.bytes(16))
+                  local span_id = str.to_hex(rand.bytes(8))
+                  tp = "00-" .. trace_id .. "-" .. span_id .. "-01"
+                end
+                local trace_id = string.sub(tp or "", 4, 35)
+                local span_id = string.sub(tp or "", 37, 52)
+                local ts = headers["tracestate"] or headers["x-tracestate"]
+                local bag = headers["baggage"] or headers["x-baggage"]
+                ngx.req.set_header("traceparent", tp)
+                ngx.req.set_header("x-traceparent", tp)
+                ngx.req.set_header("x-hasura-traceparent", tp)
+                ngx.req.set_header("x-forwarded-traceparent", tp)
+                ngx.req.set_header("x-oo-traceparent", tp)
+                ngx.req.set_header("x-request-id", tp)
+                if trace_id and trace_id ~= "" then
+                  ngx.req.set_header("x-trace-id", trace_id)
+                end
+                if span_id and span_id ~= "" then
+                  ngx.req.set_header("x-span-id", span_id)
+                end
                   if ts and ts ~= "" then
                     ngx.req.set_header("tracestate", ts)
                     ngx.req.set_header("x-tracestate", ts)
@@ -73,7 +81,7 @@ spec:
               - "^https://([a-zA-Z0-9-]+\\.)*graphql\\.app\\.suncoast\\.systems$"
             allow_origins: "https://graphql.app.suncoast.systems"
             allow_methods: "GET,POST,PUT,PATCH,DELETE,OPTIONS,HEAD"
-            allow_headers: "Authorization,Content-Type,Accept,Origin,X-Requested-With,Cache-Control,Pragma,User-Agent,X-Real-IP,X-Forwarded-For,X-Client-IP,X-Original-Forwarded-For,traceparent,tracestate,baggage,X-Traceparent,X-Tracestate,X-Baggage"
+            allow_headers: "Authorization,Content-Type,Accept,Origin,X-Requested-With,Cache-Control,Pragma,User-Agent,X-Real-IP,X-Forwarded-For,X-Client-IP,X-Original-Forwarded-For,traceparent,tracestate,baggage,X-Traceparent,X-Tracestate,X-Baggage,X-Trace-Id,X-Span-Id"
             allow_credential: true
             max_age: 86400
         - name: real-ip

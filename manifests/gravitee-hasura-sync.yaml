@@ -636,7 +636,7 @@ data:
             return ""
         return str(value)
 
-    def build_session_vars(hasura_claims, traceparent, tracestate, baggage):
+def build_session_vars(hasura_claims, traceparent, tracestate, baggage):
         session = {}
         for key, value in hasura_claims.items():
             if not isinstance(key, str):
@@ -656,7 +656,16 @@ data:
             session["X-Hasura-Tracestate"] = tracestate
         if baggage:
             session["X-Hasura-Baggage"] = baggage
-        return session
+    return session
+
+def parse_traceparent(traceparent_value):
+    if not traceparent_value:
+        return None, None
+    value = traceparent_value.strip()
+    match = re.match(r"^[0-9a-f]{2}-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}$", value)
+    if not match:
+        return None, None
+    return match.group(1), match.group(2)
 
     def normalize_request_headers(headers):
         if isinstance(headers, dict):
@@ -946,6 +955,11 @@ data:
                     }
                     if traceparent:
                         forwarded["Traceparent"] = traceparent
+                    trace_id, span_id = parse_traceparent(traceparent)
+                    if trace_id:
+                        forwarded["X-Trace-Id"] = trace_id
+                    if span_id:
+                        forwarded["X-Span-Id"] = span_id
                     if tracestate:
                         forwarded["Tracestate"] = tracestate
                     if baggage:

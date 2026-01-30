@@ -52,6 +52,8 @@ spec:
               value: "false"
             - name: HASURA_GRAPHQL_ENABLED_LOG_TYPES
               value: "startup, http-log, websocket-log, query-log"
+            - name: HASURA_GRAPHQL_LOG_HEADERS
+              value: "true"
             - name: HASURA_GRAPHQL_AUTH_HOOK
               value: "http://graphql-gravitee-sync.graphql.svc.cluster.local:8080/auth"
             - name: HASURA_GRAPHQL_AUTH_HOOK_MODE

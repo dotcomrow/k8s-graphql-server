@@ -63,3 +63,4 @@ spec:
               X-Forwarded-Traceparent: "$opentelemetry_context_traceparent"
               X-Forwarded-Tracestate: "$http_tracestate"
               X-Forwarded-Baggage: "$http_baggage"
+              X-Request-Id: "$opentelemetry_context_traceparent"

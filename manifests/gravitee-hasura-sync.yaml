@@ -658,14 +658,14 @@ data:
             session["X-Hasura-Baggage"] = baggage
         return session
 
-def parse_traceparent(traceparent_value):
-    if not traceparent_value:
-        return None, None
-    value = traceparent_value.strip()
-    match = re.match(r"^[0-9a-f]{2}-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}$", value)
-    if not match:
-        return None, None
-    return match.group(1), match.group(2)
+    def parse_traceparent(traceparent_value):
+        if not traceparent_value:
+            return None, None
+        value = traceparent_value.strip()
+        match = re.match(r"^[0-9a-f]{2}-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}$", value)
+        if not match:
+            return None, None
+        return match.group(1), match.group(2)
 
     def normalize_request_headers(headers):
         if isinstance(headers, dict):

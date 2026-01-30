@@ -23,6 +23,7 @@ data:
     import urllib.request
     import ssl
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from jwt import PyJWKClient, decode as jwt_decode
 
     MANAGED_COMMENT = "managed-by=gravitee-hasura-sync"
     DEFAULT_OPT_IN_TAGS = "hasura"
@@ -58,6 +59,25 @@ data:
     ACTION_TIMEOUT_SECONDS = int(os.environ.get("ACTION_TIMEOUT_SECONDS", "30"))
     REMOTE_SCHEMA_TIMEOUT_SECONDS = int(os.environ.get("REMOTE_SCHEMA_TIMEOUT_SECONDS", "60"))
     INSECURE_SKIP_VERIFY = os.environ.get("INSECURE_SKIP_VERIFY", "false").lower() in ("1", "true", "yes")
+
+    INTERNAL_JWK_URL = os.environ.get(
+        "INTERNAL_JWK_URL",
+        "https://auth.suncoast.systems/realms/internal/protocol/openid-connect/certs",
+    )
+    INTERNAL_ISSUER = os.environ.get("INTERNAL_ISSUER", "https://auth.suncoast.systems/realms/internal")
+    INTERNAL_AUDIENCE = os.environ.get("INTERNAL_AUDIENCE", "hasura-console-proxy")
+    EXTERNAL_JWK_URL = os.environ.get(
+        "EXTERNAL_JWK_URL",
+        "https://auth.suncoast.systems/realms/external/protocol/openid-connect/certs",
+    )
+    EXTERNAL_ISSUER = os.environ.get("EXTERNAL_ISSUER", "https://auth.suncoast.systems/realms/external")
+    EXTERNAL_AUDIENCE_PATH = os.environ.get("EXTERNAL_AUDIENCE_PATH", "/vault/secrets/graphql-api-client-id")
+    CLAIMS_NAMESPACE = "https://hasura.io/jwt/claims"
+    CLAIMS_PARENT = "https://hasura"
+    CLAIMS_CHILD = "io/jwt/claims"
+
+    _jwks_clients = {}
+    _aud_cache = {"value": None, "loaded_at": 0.0}
 
     OPENAPI_PAGE_TYPES = {"SWAGGER", "OPENAPI"}
     ACTION_MAP = {}
@@ -557,6 +577,87 @@ data:
         headers = input_data.get("headers") or {}
         return headers if isinstance(headers, dict) else {}
 
+    def load_external_audience():
+        now = time.time()
+        if _aud_cache["value"] and now - _aud_cache["loaded_at"] < 300:
+            return _aud_cache["value"]
+        aud = read_file(EXTERNAL_AUDIENCE_PATH)
+        if aud:
+            _aud_cache["value"] = aud
+            _aud_cache["loaded_at"] = now
+            return aud
+        return None
+
+    def get_jwks_client(url):
+        client = _jwks_clients.get(url)
+        if client is None:
+            client = PyJWKClient(url)
+            _jwks_clients[url] = client
+        return client
+
+    def decode_jwt(token):
+        external_aud = load_external_audience()
+        configs = [
+            {"jwk_url": INTERNAL_JWK_URL, "issuer": INTERNAL_ISSUER, "audience": INTERNAL_AUDIENCE},
+            {"jwk_url": EXTERNAL_JWK_URL, "issuer": EXTERNAL_ISSUER, "audience": external_aud},
+        ]
+        for cfg in configs:
+            if not cfg["audience"]:
+                continue
+            try:
+                key = get_jwks_client(cfg["jwk_url"]).get_signing_key_from_jwt(token).key
+                return jwt_decode(
+                    token,
+                    key,
+                    algorithms=["RS256"],
+                    audience=cfg["audience"],
+                    issuer=cfg["issuer"],
+                )
+            except Exception:
+                continue
+        return None
+
+    def extract_hasura_claims(claims):
+        if not isinstance(claims, dict):
+            return {}
+        if CLAIMS_NAMESPACE in claims and isinstance(claims[CLAIMS_NAMESPACE], dict):
+            return claims[CLAIMS_NAMESPACE]
+        parent = claims.get(CLAIMS_PARENT)
+        if isinstance(parent, dict):
+            nested = parent.get(CLAIMS_CHILD)
+            if isinstance(nested, dict):
+                return nested
+        return {}
+
+    def normalize_claim_value(value):
+        if isinstance(value, (list, dict)):
+            return json.dumps(value)
+        if value is None:
+            return ""
+        return str(value)
+
+    def build_session_vars(hasura_claims, traceparent, tracestate, baggage):
+        session = {}
+        for key, value in hasura_claims.items():
+            if not isinstance(key, str):
+                continue
+            if key.lower().startswith("x-hasura-"):
+                session_key = "X-Hasura-" + key[len("x-hasura-"):]
+            else:
+                session_key = key
+            session[session_key] = normalize_claim_value(value)
+        if "X-Hasura-Role" not in session:
+            role = hasura_claims.get("x-hasura-default-role") or hasura_claims.get("x-hasura-role")
+            if role:
+                session["X-Hasura-Role"] = normalize_claim_value(role)
+        if traceparent:
+            session["X-Hasura-Traceparent"] = traceparent
+        if tracestate:
+            session["X-Hasura-Tracestate"] = tracestate
+        if baggage:
+            session["X-Hasura-Baggage"] = baggage
+        return session
+
     def normalize_request_headers(headers):
         if isinstance(headers, dict):
             return headers
@@ -622,6 +723,55 @@ data:
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(b"ok")
+                return
+            if self.path.startswith("/auth"):
+                auth_header = self.headers.get("Authorization")
+                if not auth_header or not auth_header.lower().startswith("bearer "):
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                token = auth_header.split(" ", 1)[1].strip()
+                claims = decode_jwt(token)
+                if not claims:
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                hasura_claims = extract_hasura_claims(claims)
+                traceparent = (
+                    self.headers.get("traceparent")
+                    or self.headers.get("Traceparent")
+                    or self.headers.get("x-traceparent")
+                    or self.headers.get("X-Traceparent")
+                    or self.headers.get("x-forwarded-traceparent")
+                    or self.headers.get("X-Forwarded-Traceparent")
+                )
+                tracestate = (
+                    self.headers.get("tracestate")
+                    or self.headers.get("Tracestate")
+                    or self.headers.get("x-tracestate")
+                    or self.headers.get("X-Tracestate")
+                    or self.headers.get("x-forwarded-tracestate")
+                    or self.headers.get("X-Forwarded-Tracestate")
+                )
+                baggage = (
+                    self.headers.get("baggage")
+                    or self.headers.get("Baggage")
+                    or self.headers.get("x-baggage")
+                    or self.headers.get("X-Baggage")
+                    or self.headers.get("x-forwarded-baggage")
+                    or self.headers.get("X-Forwarded-Baggage")
+                )
+                session_vars = build_session_vars(hasura_claims, traceparent, tracestate, baggage)
+                if "X-Hasura-Role" not in session_vars:
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                body = json.dumps(session_vars).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
                 return
             self.send_response(404)
             self.end_headers()
@@ -905,6 +1055,11 @@ spec:
           {{- with secret "secret/data/gravitee-webhook-secret" -}}
           {{ .Data.data.value }}
           {{- end }}
+        vault.hashicorp.com/agent-inject-secret-graphql-api-client-id: "secret/data/keycloak-client-id-graphql-api"
+        vault.hashicorp.com/agent-inject-template-graphql-api-client-id: |
+          {{- with secret "secret/data/keycloak-client-id-graphql-api" -}}
+          {{ .Data.data.value }}
+          {{- end }}
         linkerd.io/inject: "enabled"
     spec:
       serviceAccountName: graphql-gravitee-sync
@@ -946,6 +1101,18 @@ spec:
               value: "30"
             - name: REMOTE_SCHEMA_TIMEOUT_SECONDS
               value: "60"
+            - name: INTERNAL_JWK_URL
+              value: "https://auth.suncoast.systems/realms/internal/protocol/openid-connect/certs"
+            - name: INTERNAL_ISSUER
+              value: "https://auth.suncoast.systems/realms/internal"
+            - name: INTERNAL_AUDIENCE
+              value: "hasura-console-proxy"
+            - name: EXTERNAL_JWK_URL
+              value: "https://auth.suncoast.systems/realms/external/protocol/openid-connect/certs"
+            - name: EXTERNAL_ISSUER
+              value: "https://auth.suncoast.systems/realms/external"
+            - name: EXTERNAL_AUDIENCE_PATH
+              value: "/vault/secrets/graphql-api-client-id"
           volumeMounts:
             - name: script
               mountPath: /app
@@ -953,6 +1120,7 @@ spec:
           args:
             - |
               set -euo pipefail
+              python -m pip install --no-cache-dir "pyjwt[crypto]" >/tmp/pip-auth-hook.log 2>&1
               python /app/sync.py
           readinessProbe:
             httpGet:

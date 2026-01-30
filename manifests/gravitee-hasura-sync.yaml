@@ -656,6 +656,14 @@ data:
                     request_headers_payload = normalize_request_headers(
                         (payload.get("request") or {}).get("headers")
                     )
+                    if not request_headers_payload:
+                        request_headers_payload = normalize_request_headers(
+                            payload.get("request_headers")
+                        )
+                    if not request_headers_payload:
+                        request_headers_payload = normalize_request_headers(
+                            payload.get("headers")
+                        )
                     auth_header = self.headers.get("Authorization")
                     xfwd_token = self.headers.get("X-Forwarded-Access-Token")
                     if xfwd_token:

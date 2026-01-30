@@ -26,7 +26,7 @@ spec:
               - "^https://([a-zA-Z0-9-]+\\.)*graphql\\.app\\.suncoast\\.systems$"
             allow_origins: "https://graphql.app.suncoast.systems"
             allow_methods: "GET,POST,PUT,PATCH,DELETE,OPTIONS,HEAD"
-            allow_headers: "Authorization,Content-Type,Accept,Origin,X-Requested-With,Cache-Control,Pragma,User-Agent,X-Real-IP,X-Forwarded-For,X-Client-IP,X-Original-Forwarded-For,traceparent,tracestate,baggage"
+            allow_headers: "Authorization,Content-Type,Accept,Origin,X-Requested-With,Cache-Control,Pragma,User-Agent,X-Real-IP,X-Forwarded-For,X-Client-IP,X-Original-Forwarded-For,traceparent,tracestate,baggage,X-Traceparent,X-Tracestate,X-Baggage"
             allow_credential: true
             max_age: 86400
         - name: real-ip
@@ -54,3 +54,6 @@ spec:
               Traceparent: "$opentelemetry_context_traceparent"
               Tracestate: "$http_tracestate"
               Baggage: "$http_baggage"
+              X-Traceparent: "$opentelemetry_context_traceparent"
+              X-Tracestate: "$http_tracestate"
+              X-Baggage: "$http_baggage"

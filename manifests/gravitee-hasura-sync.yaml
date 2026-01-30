@@ -637,25 +637,25 @@ data:
         return str(value)
 
 def build_session_vars(hasura_claims, traceparent, tracestate, baggage):
-        session = {}
-        for key, value in hasura_claims.items():
-            if not isinstance(key, str):
-                continue
-            if key.lower().startswith("x-hasura-"):
-                session_key = "X-Hasura-" + key[len("x-hasura-"):]
-            else:
-                session_key = key
-            session[session_key] = normalize_claim_value(value)
-        if "X-Hasura-Role" not in session:
-            role = hasura_claims.get("x-hasura-default-role") or hasura_claims.get("x-hasura-role")
-            if role:
-                session["X-Hasura-Role"] = normalize_claim_value(role)
-        if traceparent:
-            session["X-Hasura-Traceparent"] = traceparent
-        if tracestate:
-            session["X-Hasura-Tracestate"] = tracestate
-        if baggage:
-            session["X-Hasura-Baggage"] = baggage
+    session = {}
+    for key, value in hasura_claims.items():
+        if not isinstance(key, str):
+            continue
+        if key.lower().startswith("x-hasura-"):
+            session_key = "X-Hasura-" + key[len("x-hasura-"):]
+        else:
+            session_key = key
+        session[session_key] = normalize_claim_value(value)
+    if "X-Hasura-Role" not in session:
+        role = hasura_claims.get("x-hasura-default-role") or hasura_claims.get("x-hasura-role")
+        if role:
+            session["X-Hasura-Role"] = normalize_claim_value(role)
+    if traceparent:
+        session["X-Hasura-Traceparent"] = traceparent
+    if tracestate:
+        session["X-Hasura-Tracestate"] = tracestate
+    if baggage:
+        session["X-Hasura-Baggage"] = baggage
     return session
 
 def parse_traceparent(traceparent_value):

@@ -726,13 +726,23 @@ data:
                 return
             if self.path.startswith("/auth"):
                 auth_header = self.headers.get("Authorization")
+                traceparent_hdr = (
+                    self.headers.get("traceparent")
+                    or self.headers.get("Traceparent")
+                    or self.headers.get("x-traceparent")
+                    or self.headers.get("X-Traceparent")
+                    or self.headers.get("x-forwarded-traceparent")
+                    or self.headers.get("X-Forwarded-Traceparent")
+                )
                 if not auth_header or not auth_header.lower().startswith("bearer "):
+                    log("auth_request missing_bearer traceparent=" + str(traceparent_hdr))
                     self.send_response(401)
                     self.end_headers()
                     return
                 token = auth_header.split(" ", 1)[1].strip()
                 claims = decode_jwt(token)
                 if not claims:
+                    log("auth_request jwt_invalid traceparent=" + str(traceparent_hdr))
                     self.send_response(401)
                     self.end_headers()
                     return
@@ -763,9 +773,11 @@ data:
                 )
                 session_vars = build_session_vars(hasura_claims, traceparent, tracestate, baggage)
                 if "X-Hasura-Role" not in session_vars:
+                    log("auth_request missing_role traceparent=" + str(traceparent_hdr))
                     self.send_response(401)
                     self.end_headers()
                     return
+                log("auth_request ok traceparent=" + str(traceparent_hdr))
                 body = json.dumps(session_vars).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")

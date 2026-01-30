@@ -19,6 +19,16 @@ spec:
         - serviceName: hasura
           servicePort: 8080
       plugins:
+        - name: opentelemetry
+          enable: true
+          config:
+            collector:
+              address: otel-collector.observability.svc.cluster.local:4318
+            resource:
+              service.name: graphql
+              service.namespace: graphql
+            sampler:
+              name: always_on
         - name: cors
           enable: true
           config:

@@ -40,6 +40,7 @@ spec:
                 ngx.req.set_header("x-traceparent", tp)
                 ngx.req.set_header("x-hasura-traceparent", tp)
                 ngx.req.set_header("x-forwarded-traceparent", tp)
+                ngx.req.set_header("x-oo-traceparent", tp)
                 ngx.req.set_header("x-request-id", tp)
                 if ts and ts ~= "" then
                   ngx.req.set_header("tracestate", ts)

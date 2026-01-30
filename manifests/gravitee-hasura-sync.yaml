@@ -733,6 +733,8 @@ data:
                     or self.headers.get("X-Traceparent")
                     or self.headers.get("x-forwarded-traceparent")
                     or self.headers.get("X-Forwarded-Traceparent")
+                    or self.headers.get("x-oo-traceparent")
+                    or self.headers.get("X-Oo-Traceparent")
                 )
                 if not auth_header or not auth_header.lower().startswith("bearer "):
                     log("auth_request missing_bearer traceparent=" + str(traceparent_hdr))
@@ -754,6 +756,8 @@ data:
                     or self.headers.get("X-Traceparent")
                     or self.headers.get("x-forwarded-traceparent")
                     or self.headers.get("X-Forwarded-Traceparent")
+                    or self.headers.get("x-oo-traceparent")
+                    or self.headers.get("X-Oo-Traceparent")
                 )
                 tracestate = (
                     self.headers.get("tracestate")
@@ -888,8 +892,12 @@ data:
                         or incoming_headers.get("X-Traceparent")
                         or incoming_headers.get("x-forwarded-traceparent")
                         or incoming_headers.get("X-Forwarded-Traceparent")
+                        or incoming_headers.get("x-oo-traceparent")
+                        or incoming_headers.get("X-Oo-Traceparent")
                         or get_header_value(request_headers_payload, "traceparent")
                         or get_header_value(session_vars, "x-hasura-traceparent")
+                        or get_header_value(request_headers_payload, "x-oo-traceparent")
+                        or get_header_value(session_vars, "x-oo-traceparent")
                     )
                     tracestate = (
                         incoming_headers.get("tracestate")

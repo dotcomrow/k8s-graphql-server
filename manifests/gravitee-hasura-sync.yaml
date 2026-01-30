@@ -699,12 +699,16 @@ data:
                         + " incoming_header_keys="
                         + ",".join(sorted([str(k) for k in incoming_headers.keys()]))
                     )
+                    session_vars = payload.get("session_variables") if isinstance(payload, dict) else None
+                    if not isinstance(session_vars, dict):
+                        session_vars = {}
                     traceparent = (
                         incoming_headers.get("traceparent")
                         or incoming_headers.get("Traceparent")
                         or incoming_headers.get("x-traceparent")
                         or incoming_headers.get("X-Traceparent")
                         or get_header_value(request_headers_payload, "traceparent")
+                        or get_header_value(session_vars, "x-hasura-traceparent")
                     )
                     tracestate = (
                         incoming_headers.get("tracestate")
@@ -712,6 +716,7 @@ data:
                         or incoming_headers.get("x-tracestate")
                         or incoming_headers.get("X-Tracestate")
                         or get_header_value(request_headers_payload, "tracestate")
+                        or get_header_value(session_vars, "x-hasura-tracestate")
                     )
                     baggage = (
                         incoming_headers.get("baggage")
@@ -719,6 +724,7 @@ data:
                         or incoming_headers.get("x-baggage")
                         or incoming_headers.get("X-Baggage")
                         or get_header_value(request_headers_payload, "baggage")
+                        or get_header_value(session_vars, "x-hasura-baggage")
                     )
                     forwarded = {
                         "X-Forwarded-For": (

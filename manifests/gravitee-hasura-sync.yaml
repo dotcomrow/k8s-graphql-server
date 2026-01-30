@@ -557,6 +557,32 @@ data:
         headers = input_data.get("headers") or {}
         return headers if isinstance(headers, dict) else {}
 
+    def normalize_request_headers(headers):
+        if isinstance(headers, dict):
+            return headers
+        if isinstance(headers, list):
+            normalized = {}
+            for item in headers:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name")
+                value = item.get("value")
+                if name and value is not None:
+                    normalized[str(name)] = value
+            return normalized
+        return {}
+
+    def get_header_value(headers, key):
+        if not isinstance(headers, dict):
+            return None
+        if key in headers:
+            return headers.get(key)
+        lower_key = key.lower()
+        for k, v in headers.items():
+            if str(k).lower() == lower_key:
+                return v
+        return None
+
     def handle_action(action_name, input_data, auth_header):
         with ACTION_LOCK:
             entry = ACTION_MAP.get(action_name)
@@ -627,6 +653,9 @@ data:
                         and isinstance(input_data.get("input"), dict)
                     ):
                         input_data = input_data["input"]
+                    request_headers_payload = normalize_request_headers(
+                        (payload.get("request") or {}).get("headers")
+                    )
                     auth_header = self.headers.get("Authorization")
                     xfwd_token = self.headers.get("X-Forwarded-Access-Token")
                     if xfwd_token:
@@ -642,25 +671,43 @@ data:
                         or incoming_headers.get("Traceparent")
                         or incoming_headers.get("x-traceparent")
                         or incoming_headers.get("X-Traceparent")
+                        or get_header_value(request_headers_payload, "traceparent")
                     )
                     tracestate = (
                         incoming_headers.get("tracestate")
                         or incoming_headers.get("Tracestate")
                         or incoming_headers.get("x-tracestate")
                         or incoming_headers.get("X-Tracestate")
+                        or get_header_value(request_headers_payload, "tracestate")
                     )
                     baggage = (
                         incoming_headers.get("baggage")
                         or incoming_headers.get("Baggage")
                         or incoming_headers.get("x-baggage")
                         or incoming_headers.get("X-Baggage")
+                        or get_header_value(request_headers_payload, "baggage")
                     )
                     forwarded = {
-                        "X-Forwarded-For": incoming_headers.get("X-Forwarded-For"),
-                        "X-Client-IP": incoming_headers.get("X-Client-IP"),
-                        "X-Real-IP": incoming_headers.get("X-Real-IP"),
-                        "X-Forwarded-Proto": incoming_headers.get("X-Forwarded-Proto"),
-                        "X-Forwarded-Host": incoming_headers.get("X-Forwarded-Host"),
+                        "X-Forwarded-For": (
+                            incoming_headers.get("X-Forwarded-For")
+                            or get_header_value(request_headers_payload, "x-forwarded-for")
+                        ),
+                        "X-Client-IP": (
+                            incoming_headers.get("X-Client-IP")
+                            or get_header_value(request_headers_payload, "x-client-ip")
+                        ),
+                        "X-Real-IP": (
+                            incoming_headers.get("X-Real-IP")
+                            or get_header_value(request_headers_payload, "x-real-ip")
+                        ),
+                        "X-Forwarded-Proto": (
+                            incoming_headers.get("X-Forwarded-Proto")
+                            or get_header_value(request_headers_payload, "x-forwarded-proto")
+                        ),
+                        "X-Forwarded-Host": (
+                            incoming_headers.get("X-Forwarded-Host")
+                            or get_header_value(request_headers_payload, "x-forwarded-host")
+                        ),
                     }
                     if traceparent:
                         forwarded["Traceparent"] = traceparent

@@ -110,7 +110,11 @@ spec:
               last_graphql_aud="$graphql_aud"
               export HASURA_GRAPHQL_DATABASE_URL="$last_db"
               export HASURA_GRAPHQL_ADMIN_SECRET="$last_admin"
-              build_jwt_secrets
+              if [ -n "${HASURA_GRAPHQL_AUTH_HOOK:-}" ]; then
+                unset HASURA_GRAPHQL_JWT_SECRETS
+              else
+                build_jwt_secrets
+              fi
               start_hasura
 
               while :; do
@@ -121,7 +125,11 @@ spec:
                   last_graphql_aud="$graphql_aud"
                   export HASURA_GRAPHQL_DATABASE_URL="$last_db"
                   export HASURA_GRAPHQL_ADMIN_SECRET="$last_admin"
-                  build_jwt_secrets
+                  if [ -n "${HASURA_GRAPHQL_AUTH_HOOK:-}" ]; then
+                    unset HASURA_GRAPHQL_JWT_SECRETS
+                  else
+                    build_jwt_secrets
+                  fi
                   if kill -0 "$HASURA_PID" 2>/dev/null; then
                     kill -TERM "$HASURA_PID"
                     wait "$HASURA_PID" || true

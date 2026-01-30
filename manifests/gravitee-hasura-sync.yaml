@@ -702,6 +702,13 @@ data:
                     session_vars = payload.get("session_variables") if isinstance(payload, dict) else None
                     if not isinstance(session_vars, dict):
                         session_vars = {}
+                    if session_vars:
+                        log(
+                            "action="
+                            + str(action_name)
+                            + " session_var_keys="
+                            + ",".join(sorted([str(k) for k in session_vars.keys()]))
+                        )
                     traceparent = (
                         incoming_headers.get("traceparent")
                         or incoming_headers.get("Traceparent")

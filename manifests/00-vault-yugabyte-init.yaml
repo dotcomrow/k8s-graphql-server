@@ -3,6 +3,9 @@ kind: ServiceAccount
 metadata:
   name: graphql-vault-init
   namespace: vault
+  annotations:
+    # ArgoCD sync-waves: create the ServiceAccount before the Job that uses it.
+    argocd.argoproj.io/sync-wave: "-5"
 ---
 apiVersion: batch/v1
 kind: Job

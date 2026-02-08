@@ -355,6 +355,7 @@ spec:
               vault policy write "graphql" - <<'EOF'
               path "secret/data/graphql/*" { capabilities = ["read"] }
               path "secret/data/keycloak-client-id-graphql-api" { capabilities = ["read"] }
+              path "secret/data/redis" { capabilities = ["read"] }
               EOF
 
               vault write auth/${AUTH_PATH}/role/graphql \

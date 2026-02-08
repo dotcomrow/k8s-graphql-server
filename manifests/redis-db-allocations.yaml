@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-db-allocations
+  namespace: graphql
+data:
+  allocations.yaml: |
+    # Redis logical DB allocations (shared Redis instance)
+    #
+    # NOTE: Redis "databases" are numeric (0..N). They cannot be renamed.
+    # This file is the source-of-truth mapping for what each DB number is used for.
+    #
+    # Primary endpoint (writes):
+    #   redis-0.redis-headless.redis.svc.cluster.local:6379
+    #
+    allocations:
+      - db: 1
+        purpose: hasura-console-proxy oauth2-proxy session store
+        manifest: manifests/hasura-console-proxy.yaml
+      - db: 2
+        purpose: hasura graphql-engine query response cache (HASURA_GRAPHQL_REDIS_URL)
+        manifest: manifests/hasura.yaml
+

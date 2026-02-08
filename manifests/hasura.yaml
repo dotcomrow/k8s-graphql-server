@@ -37,6 +37,13 @@ spec:
           {{- with secret "secret/data/keycloak-client-id-graphql-api" -}}
           {{ .Data.data.value }}
           {{- end }}
+        vault.hashicorp.com/agent-inject-secret-redis-url: "secret/data/redis"
+        vault.hashicorp.com/agent-inject-template-redis-url: |
+          {{- with secret "secret/data/redis" -}}
+          {{- $raw := .Data.data.password -}}
+          {{- $enc := $raw | urlquery -}}
+          redis://:{{ $enc }}@redis-0.redis-headless.redis.svc.cluster.local:6379/2
+          {{- end }}
         linkerd.io/inject: "enabled"
     spec:
       serviceAccountName: hasura
@@ -45,23 +52,32 @@ spec:
           image: hasura/graphql-engine:v2.38.0
           ports:
             - containerPort: 8080
-          env:
-            - name: HASURA_GRAPHQL_ENABLE_CONSOLE
-              value: "true"
-            - name: HASURA_GRAPHQL_DEV_MODE
-              value: "false"
-            - name: HASURA_GRAPHQL_ENABLED_LOG_TYPES
-              value: "startup, http-log, websocket-log, query-log"
-            - name: HASURA_GRAPHQL_LOG_HEADERS
-              value: "true"
-            - name: HASURA_GRAPHQL_AUTH_HOOK
-              value: "http://graphql-gravitee-sync.graphql.svc.cluster.local:8080/auth"
-            - name: HASURA_GRAPHQL_AUTH_HOOK_MODE
-              value: "GET"
           command: ["/bin/sh","-c"]
           args:
             - |
               set -eu
+              load_env_defaults() {
+                path="$1"
+                [ -f "$path" ] || return 0
+                # Load VAR=... assignments from $path but do NOT override env vars
+                # already set on the container (e.g. via the Deployment manifest).
+                while IFS= read -r line || [ -n "$line" ]; do
+                  case "$line" in
+                    ''|\#*) continue ;;
+                    export\ *) line="${line#export }" ;;
+                  esac
+                  case "$line" in
+                    [A-Z_][A-Z0-9_]*=*)
+                      var="${line%%=*}"
+                      if eval "[ -n \"\${$var+x}\" ]"; then
+                        continue
+                      fi
+                      eval "export $line"
+                      ;;
+                  esac
+                done < "$path"
+              }
+              load_env_defaults /etc/hasura/hasura.env
               wait_for_file() {
                 path="$1"
                 while [ ! -s "$path" ]; do
@@ -72,11 +88,18 @@ spec:
               wait_for_file /vault/secrets/db-url
               wait_for_file /vault/secrets/hasura-admin
               wait_for_file /vault/secrets/graphql-api-client-id
+              if [ -z "${HASURA_GRAPHQL_REDIS_URL+x}" ]; then
+                wait_for_file /vault/secrets/redis-url
+              fi
 
               read_secrets() {
                 db="$(cat /vault/secrets/db-url)"
                 admin="$(cat /vault/secrets/hasura-admin)"
                 graphql_aud="$(tr -d '\r\n' < /vault/secrets/graphql-api-client-id)"
+                redis_url=""
+                if [ -z "${HASURA_GRAPHQL_REDIS_URL+x}" ] && [ -s /vault/secrets/redis-url ]; then
+                  redis_url="$(cat /vault/secrets/redis-url)"
+                fi
                 if [ -z "${graphql_aud:-}" ]; then
                   echo "graphql api client id is empty"
                   exit 1
@@ -110,8 +133,12 @@ spec:
               last_db="$db"
               last_admin="$admin"
               last_graphql_aud="$graphql_aud"
+              last_redis_url="$redis_url"
               export HASURA_GRAPHQL_DATABASE_URL="$last_db"
               export HASURA_GRAPHQL_ADMIN_SECRET="$last_admin"
+              if [ -z "${HASURA_GRAPHQL_REDIS_URL+x}" ] && [ -n "${redis_url:-}" ]; then
+                export HASURA_GRAPHQL_REDIS_URL="$redis_url"
+              fi
               if [ -n "${HASURA_GRAPHQL_AUTH_HOOK:-}" ]; then
                 unset HASURA_GRAPHQL_JWT_SECRETS
               else
@@ -121,12 +148,16 @@ spec:
 
               while :; do
                 read_secrets
-                if [ "$db" != "$last_db" ] || [ "$admin" != "$last_admin" ] || [ "$graphql_aud" != "$last_graphql_aud" ]; then
+                if [ "$db" != "$last_db" ] || [ "$admin" != "$last_admin" ] || [ "$graphql_aud" != "$last_graphql_aud" ] || [ "${redis_url:-}" != "${last_redis_url:-}" ]; then
                   last_db="$db"
                   last_admin="$admin"
                   last_graphql_aud="$graphql_aud"
+                  last_redis_url="$redis_url"
                   export HASURA_GRAPHQL_DATABASE_URL="$last_db"
                   export HASURA_GRAPHQL_ADMIN_SECRET="$last_admin"
+                  if [ -z "${HASURA_GRAPHQL_REDIS_URL+x}" ] && [ -n "${redis_url:-}" ]; then
+                    export HASURA_GRAPHQL_REDIS_URL="$redis_url"
+                  fi
                   if [ -n "${HASURA_GRAPHQL_AUTH_HOOK:-}" ]; then
                     unset HASURA_GRAPHQL_JWT_SECRETS
                   else
@@ -142,6 +173,10 @@ spec:
                 fi
                 sleep 10
               done
+          volumeMounts:
+            - name: hasura-config
+              mountPath: /etc/hasura
+              readOnly: true
           readinessProbe:
             httpGet:
               path: /healthz
@@ -156,6 +191,13 @@ spec:
             initialDelaySeconds: 30
             periodSeconds: 20
             timeoutSeconds: 5
+      volumes:
+        - name: hasura-config
+          configMap:
+            name: hasura-config
+            items:
+              - key: hasura.env
+                path: hasura.env
 ---
 apiVersion: v1
 kind: Service

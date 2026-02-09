@@ -356,6 +356,26 @@ def _sh_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
+def _sh_unquote_simple(value_rhs: str) -> str:
+    """
+    Best-effort unquoting for values produced by `_sh_quote`.
+
+    This is intentionally minimal and only needs to handle our generated
+    defaults (no embedded newlines). If the value isn't single-quoted, it's
+    returned unchanged.
+    """
+
+    v = value_rhs.strip()
+    if len(v) >= 2 and v[0] == "'" and v[-1] == "'":
+        inner = v[1:-1]
+        # Reverse the common `'\"'\"'` escape used to embed single quotes in a
+        # single-quoted POSIX shell string.
+        return inner.replace("'\"'\"'", "'")
+    if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+        return v[1:-1]
+    return v
+
+
 def _wrap_comment(text: str, *, width: int = 92, indent: str = "# ") -> List[str]:
     words = text.split()
     if not words:
@@ -469,7 +489,7 @@ def _default_for(var: str, doc: str) -> Optional[str]:
     return None
 
 
-def _normalize_default(var: str, default: str) -> Optional[str]:
+def _normalize_default(var: str, default: str, doc: str) -> Optional[str]:
     """
     Convert the doc-extracted default into something safe to assign.
 
@@ -484,16 +504,38 @@ def _normalize_default(var: str, default: str) -> Optional[str]:
     if d.lower() == "forever":
         return None
 
-    # Common unit patterns.
-    m = re.match(r"^([0-9]+)\s*sec(?:onds?)?$", d, flags=re.IGNORECASE)
-    if m:
-        return m.group(1)
+    doc_l = doc.lower()
 
-    # Help sometimes uses "1 second" for millisecond values (events fetch interval).
-    if var in {"HASURA_GRAPHQL_EVENTS_FETCH_INTERVAL"} and re.search(r"\bsecond\b", d, flags=re.IGNORECASE):
-        m = re.match(r"^([0-9]+)\s*second", d, flags=re.IGNORECASE)
-        if m:
-            return str(int(m.group(1)) * 1000)
+    # Hasura shows this default as "1MB" in help output, but the env var expects
+    # an Int (bytes).
+    if var == "HASURA_GRAPHQL_MAX_TOTAL_HEADER_LENGTH":
+        m_size = re.match(r"^([0-9]+)\s*([KMG]B)$", d, flags=re.IGNORECASE)
+        if m_size:
+            n = int(m_size.group(1))
+            unit = m_size.group(2).upper()
+            mult = {"KB": 1024, "MB": 1024 * 1024, "GB": 1024 * 1024 * 1024}[unit]
+            return str(n * mult)
+
+    # If the default starts with a number and then has units/explanation, prefer
+    # the numeric token. This avoids writing defaults like "1000 (1sec)" that
+    # the server cannot parse as an Int.
+    #
+    # We *intentionally* do NOT match values like "1MB" (no word boundary).
+    m = re.match(r"^([0-9][0-9,]*)\b(.*)$", d)
+    if m:
+        num_raw = m.group(1)
+        rest = (m.group(2) or "").strip().lower()
+        num = num_raw.replace(",", "")
+
+        # If the doc says "milliseconds" but the default is expressed as seconds
+        # (e.g. "1 second"), convert seconds -> milliseconds.
+        if "millisecond" in doc_l and ("sec" in rest or "second" in rest) and "(" not in d:
+            try:
+                return str(int(num) * 1000)
+            except ValueError:
+                pass
+
+        return num
 
     # Keep as-is for:
     # - booleans: true/false
@@ -588,7 +630,7 @@ def _render_env(
             else:
                 default_raw = _default_for(var, doc)
                 if default_raw is not None:
-                    normalized = _normalize_default(var, default_raw)
+                    normalized = _normalize_default(var, default_raw, doc)
                     if normalized is not None:
                         value_rhs = _sh_quote(normalized)
 
@@ -668,6 +710,41 @@ def main() -> int:
 
     # One-time migration: pull any env values currently set in the deployment manifest.
     manifest_overrides = _parse_manifest_env_overrides(HASURA_MANIFEST)
+
+    # Fix up previously-generated defaults that are not machine-parseable.
+    # Example: help text may say "Default: 1000 (1sec)" but the server expects
+    # just "1000".
+    fixed_existing = dict(existing_values)
+    for var, rhs in existing_values.items():
+        doc = docs.get(var) or MANUAL_DOCS.get(var) or ""
+        if not doc:
+            continue
+        default_raw = _default_for(var, doc)
+        if default_raw is None:
+            continue
+        normalized = _normalize_default(var, default_raw, doc)
+        if normalized is None:
+            continue
+
+        raw = _sh_unquote_simple(rhs)
+
+        # If the existing value is exactly the doc default, but normalization
+        # would change it, update to the normalized form.
+        if raw == default_raw and normalized != default_raw:
+            fixed_existing[var] = _sh_quote(normalized)
+            continue
+
+        # If the doc says milliseconds, but the default is written in seconds,
+        # older generator versions may have stored the seconds value.
+        doc_l = doc.lower()
+        if "millisecond" in doc_l and "second" in default_raw.lower():
+            m = re.match(r"^([0-9][0-9,]*)\b", default_raw)
+            if m:
+                seconds = m.group(1).replace(",", "")
+                if raw == seconds and normalized != seconds:
+                    fixed_existing[var] = _sh_quote(normalized)
+
+    existing_values = fixed_existing
 
     # Optional: allow your shell environment to override non-sensitive settings
     # when generating (useful for "my settings" without editing the file).

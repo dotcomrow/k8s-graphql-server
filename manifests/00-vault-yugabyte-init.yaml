@@ -353,8 +353,8 @@ spec:
               EOF
 
               vault policy write "externalsecrets-graphql" - <<'EOF'
-              path "secret/data/graphql/cloudflare-tunnel-token" { capabilities = ["read"] }
-              path "secret/metadata/graphql/cloudflare-tunnel-token" { capabilities = ["read", "list"] }
+              path "secret/data/cloudflare-tunnel-token" { capabilities = ["read"] }
+              path "secret/metadata/cloudflare-tunnel-token" { capabilities = ["read", "list"] }
               EOF
 
               vault write auth/${AUTH_PATH}/role/externalsecrets-graphql \

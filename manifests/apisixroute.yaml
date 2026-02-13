@@ -14,7 +14,7 @@ spec:
       match:
         hosts:
           - "graphql.app.suncoast.systems"
-          - "graphql-origin.app.suncoast.systems"
+          - "graphql-origin.suncoast.systems"
         paths: ["/v1/graphql", "/v1/graphql/*"]
       backends:
         - serviceName: hasura
@@ -78,7 +78,7 @@ spec:
         - name: cors
           enable: true
           config:
-            allow_origins: "https://graphql.app.suncoast.systems,https://graphql-origin.app.suncoast.systems,https://cf-suncoast-graphql-proxy.dev.suncoast.systems"
+            allow_origins: "https://graphql.app.suncoast.systems,https://graphql-origin.suncoast.systems,https://cf-suncoast-graphql-proxy.dev.suncoast.systems"
             allow_methods: "GET,POST,OPTIONS"
             allow_headers: "Authorization,Content-Type,Accept,Origin,X-Requested-With,Cache-Control,Pragma,User-Agent,X-Real-IP,X-Forwarded-For,X-Client-IP,X-Original-Forwarded-For,traceparent,tracestate,baggage,X-Traceparent,X-Tracestate,X-Baggage,X-Trace-Id,X-Span-Id"
             allow_credential: true

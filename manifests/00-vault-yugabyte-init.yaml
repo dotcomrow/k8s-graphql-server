@@ -358,8 +358,8 @@ spec:
               EOF
 
               vault write auth/${AUTH_PATH}/role/externalsecrets-graphql \
-                bound_service_account_names="external-secrets-sa" \
-                bound_service_account_namespaces="external-secrets" \
+                bound_service_account_names="cloudflare-tunnel-external-secrets" \
+                bound_service_account_namespaces="graphql" \
                 policies="externalsecrets-graphql" \
                 ttl="48h"
 

@@ -53,6 +53,7 @@ vault kv put secret/cloudflare-tunnel-token vaule='<PASTE_TUNNEL_TOKEN>'
 
 3. Deploy these manifests via ArgoCD sync (do not apply manually):
 - `manifests/00-vault-yugabyte-init.yaml`
+- `manifests/cloudflare-tunnel-secretstore-sa.yaml`
 - `manifests/cloudflare-tunnel-secretstore.yaml`
 - `manifests/cloudflare-tunnel-externalsecret.yaml`
 - `manifests/cloudflare-tunnel.yaml`

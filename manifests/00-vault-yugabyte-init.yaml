@@ -352,6 +352,17 @@ spec:
               path "${DB_MOUNT}/static-creds/${ROLE_STATIC_RO}" { capabilities = ["read"] }
               EOF
 
+              vault policy write "externalsecrets-graphql" - <<'EOF'
+              path "secret/data/graphql/cloudflare-tunnel-token" { capabilities = ["read"] }
+              path "secret/metadata/graphql/cloudflare-tunnel-token" { capabilities = ["read", "list"] }
+              EOF
+
+              vault write auth/${AUTH_PATH}/role/externalsecrets-graphql \
+                bound_service_account_names="external-secrets-sa" \
+                bound_service_account_namespaces="external-secrets" \
+                policies="externalsecrets-graphql" \
+                ttl="48h"
+
               vault policy write "graphql" - <<'EOF'
               path "secret/data/graphql/*" { capabilities = ["read"] }
               path "secret/data/keycloak-client-id-graphql-api" { capabilities = ["read"] }

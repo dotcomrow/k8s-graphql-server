@@ -120,6 +120,31 @@ spec:
                 done
               }
 
+              run_vault_rotate_with_retry() {
+                role_name="$1"
+                attempt=1
+                while [ "$attempt" -le "$DDL_RETRY_ATTEMPTS" ]; do
+                  set +e
+                  output="$(vault write -f "${DB_MOUNT}/rotate-role/${role_name}" 2>&1)"
+                  status=$?
+                  set -e
+                  if [ "$status" -eq 0 ]; then
+                    [ -n "$output" ] && printf "%s\n" "$output"
+                    return 0
+                  fi
+                  printf "%s\n" "$output" >&2
+                  if printf '%s' "$output" | grep -Eqi "SQLSTATE 40001|MISMATCHED_SCHEMA|catalog snapshot.*invalidated|unable to finish rotating credentials" \
+                    && [ "$attempt" -lt "$DDL_RETRY_ATTEMPTS" ]; then
+                    echo "Vault rotate-role transient failure for ${role_name}; retrying in ${DDL_RETRY_SLEEP}s (attempt ${attempt}/${DDL_RETRY_ATTEMPTS})"
+                    sleep "$DDL_RETRY_SLEEP"
+                    attempt=$((attempt + 1))
+                    continue
+                  fi
+                  echo "Vault rotate-role failed for ${role_name} after ${attempt} attempt(s)"
+                  return "$status"
+                done
+              }
+
               apk add --no-cache postgresql15-client jq netcat-openbsd curl >/dev/null || true
               export PATH="$PATH:/vault-bin"
               export VAULT_ADDR
@@ -342,8 +367,8 @@ spec:
                 rotation_period="24h" \
                 rotation_statements="ALTER ROLE \"${USER_RO}\" WITH PASSWORD '{{password}}';"
 
-              vault write -f "${DB_MOUNT}/rotate-role/${ROLE_STATIC_ADMIN}" >/dev/null
-              vault write -f "${DB_MOUNT}/rotate-role/${ROLE_STATIC_RO}" >/dev/null
+              run_vault_rotate_with_retry "${ROLE_STATIC_ADMIN}"
+              run_vault_rotate_with_retry "${ROLE_STATIC_RO}"
 
               vault policy write "${ROLE_STATIC_ADMIN}" - <<EOF
               path "${DB_MOUNT}/static-creds/${ROLE_STATIC_ADMIN}" { capabilities = ["read"] }

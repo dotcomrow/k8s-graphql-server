@@ -63,6 +63,14 @@ Argo sync order is set with sync-wave annotations so Vault role/policy and Secre
 4. In Cloudflare Zero Trust, add public hostname routing for the tunnel:
    - Example hostname: `cf-suncoast-graphql-proxy.dev.suncoast.systems`
    - Service URL: `http://hasura.graphql.svc.cluster.local:8080`
+   - Restrict the public route to `/v1/graphql` and `/v1/graphql/*`.
+
+No APISIX route is required for public Hasura ingress in this setup; Cloudflare Tunnel is the only external entrypoint.
+
+### Origin header/logging context
+When traffic comes through Cloudflare Tunnel, client/proxy context should come from Cloudflare headers (for example `CF-Connecting-IP`, `CF-Ray`) plus forwarded headers (`X-Forwarded-For`, `X-Request-Id`).
+
+`manifests/gravitee-hasura-sync.yaml` maps these headers into action upstream requests and logs them, so action logs keep client IP/request correlation without APISIX.
 
 ### Verify
 ```sh

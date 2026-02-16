@@ -735,6 +735,15 @@ data:
                 return
             if self.path.startswith("/auth"):
                 auth_header = self.headers.get("Authorization")
+                cf_connecting_ip = self.headers.get("CF-Connecting-IP") or self.headers.get("Cf-Connecting-Ip")
+                xff = self.headers.get("X-Forwarded-For") or self.headers.get("x-forwarded-for")
+                client_ip = cf_connecting_ip or (xff.split(",", 1)[0].strip() if xff else "")
+                request_id = (
+                    self.headers.get("X-Request-Id")
+                    or self.headers.get("x-request-id")
+                    or self.headers.get("CF-Ray")
+                    or self.headers.get("Cf-Ray")
+                )
                 traceparent_hdr = (
                     self.headers.get("traceparent")
                     or self.headers.get("Traceparent")
@@ -746,14 +755,28 @@ data:
                     or self.headers.get("X-Oo-Traceparent")
                 )
                 if not auth_header or not auth_header.lower().startswith("bearer "):
-                    log("auth_request missing_bearer traceparent=" + str(traceparent_hdr))
+                    log(
+                        "auth_request missing_bearer traceparent="
+                        + str(traceparent_hdr)
+                        + " client_ip="
+                        + str(client_ip)
+                        + " request_id="
+                        + str(request_id)
+                    )
                     self.send_response(401)
                     self.end_headers()
                     return
                 token = auth_header.split(" ", 1)[1].strip()
                 claims = decode_jwt(token)
                 if not claims:
-                    log("auth_request jwt_invalid traceparent=" + str(traceparent_hdr))
+                    log(
+                        "auth_request jwt_invalid traceparent="
+                        + str(traceparent_hdr)
+                        + " client_ip="
+                        + str(client_ip)
+                        + " request_id="
+                        + str(request_id)
+                    )
                     self.send_response(401)
                     self.end_headers()
                     return
@@ -786,11 +809,25 @@ data:
                 )
                 session_vars = build_session_vars(hasura_claims, traceparent, tracestate, baggage)
                 if "X-Hasura-Role" not in session_vars:
-                    log("auth_request missing_role traceparent=" + str(traceparent_hdr))
+                    log(
+                        "auth_request missing_role traceparent="
+                        + str(traceparent_hdr)
+                        + " client_ip="
+                        + str(client_ip)
+                        + " request_id="
+                        + str(request_id)
+                    )
                     self.send_response(401)
                     self.end_headers()
                     return
-                log("auth_request ok traceparent=" + str(traceparent_hdr))
+                log(
+                    "auth_request ok traceparent="
+                    + str(traceparent_hdr)
+                    + " client_ip="
+                    + str(client_ip)
+                    + " request_id="
+                    + str(request_id)
+                )
                 body = json.dumps(session_vars).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -874,16 +911,40 @@ data:
                         + " incoming_header_keys="
                         + ",".join(sorted([str(k) for k in incoming_headers.keys()]))
                     )
-                    traceparent_from_request_id = incoming_headers.get("x-request-id") or incoming_headers.get("X-Request-Id")
-                    if traceparent_from_request_id:
+                    cf_connecting_ip = (
+                        incoming_headers.get("CF-Connecting-IP")
+                        or incoming_headers.get("Cf-Connecting-Ip")
+                        or get_header_value(request_headers_payload, "cf-connecting-ip")
+                    )
+                    cf_ray = (
+                        incoming_headers.get("CF-Ray")
+                        or incoming_headers.get("Cf-Ray")
+                        or get_header_value(request_headers_payload, "cf-ray")
+                    )
+                    cf_ip_country = (
+                        incoming_headers.get("CF-IPCountry")
+                        or incoming_headers.get("Cf-IPCountry")
+                        or get_header_value(request_headers_payload, "cf-ipcountry")
+                    )
+                    cf_visitor = (
+                        incoming_headers.get("CF-Visitor")
+                        or incoming_headers.get("Cf-Visitor")
+                        or get_header_value(request_headers_payload, "cf-visitor")
+                    )
+                    request_id = (
+                        incoming_headers.get("x-request-id")
+                        or incoming_headers.get("X-Request-Id")
+                        or get_header_value(request_headers_payload, "x-request-id")
+                        or cf_ray
+                    )
+                    if request_id:
                         log(
                             "action="
                             + str(action_name)
                             + " x_request_id="
-                            + str(traceparent_from_request_id)
+                            + str(request_id)
                         )
-                    if traceparent_from_request_id:
-                        traceparent_from_request_id = traceparent_from_request_id.strip()
+                    traceparent_from_request_id = request_id.strip() if request_id else None
                     session_vars = payload.get("session_variables") if isinstance(payload, dict) else None
                     if not isinstance(session_vars, dict):
                         session_vars = {}
@@ -935,14 +996,17 @@ data:
                         "X-Forwarded-For": (
                             incoming_headers.get("X-Forwarded-For")
                             or get_header_value(request_headers_payload, "x-forwarded-for")
+                            or cf_connecting_ip
                         ),
                         "X-Client-IP": (
                             incoming_headers.get("X-Client-IP")
                             or get_header_value(request_headers_payload, "x-client-ip")
+                            or cf_connecting_ip
                         ),
                         "X-Real-IP": (
                             incoming_headers.get("X-Real-IP")
                             or get_header_value(request_headers_payload, "x-real-ip")
+                            or cf_connecting_ip
                         ),
                         "X-Forwarded-Proto": (
                             incoming_headers.get("X-Forwarded-Proto")
@@ -952,7 +1016,13 @@ data:
                             incoming_headers.get("X-Forwarded-Host")
                             or get_header_value(request_headers_payload, "x-forwarded-host")
                         ),
+                        "CF-Connecting-IP": cf_connecting_ip,
+                        "CF-Ray": cf_ray,
+                        "CF-IPCountry": cf_ip_country,
+                        "CF-Visitor": cf_visitor,
                     }
+                    if request_id:
+                        forwarded["X-Request-Id"] = request_id
                     if traceparent:
                         forwarded["Traceparent"] = traceparent
                     trace_id, span_id = parse_traceparent(traceparent)
@@ -987,6 +1057,12 @@ data:
                         + str(input_headers.get("X-Forwarded-For", ""))
                         + " client_ip="
                         + str(input_headers.get("X-Client-IP", ""))
+                        + " cf_connecting_ip="
+                        + str(input_headers.get("CF-Connecting-IP", ""))
+                        + " request_id="
+                        + str(input_headers.get("X-Request-Id", ""))
+                        + " cf_ray="
+                        + str(input_headers.get("CF-Ray", ""))
                         + " user_id="
                         + str(user_claims.get("user_id", ""))
                         + " user_email="

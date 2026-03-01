@@ -23,6 +23,7 @@ spec:
         linkerd.io/inject: "disabled"
         reloader.stakater.com/auto: "true"
         vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/agent-pre-populate-only: "true"
         vault.hashicorp.com/role: "graphql-kafka-setup"
         vault.hashicorp.com/agent-inject-secret-kafka-async-username: "secret/data/graphql-kafka-async-username"
         vault.hashicorp.com/agent-inject-template-kafka-async-username: |
@@ -44,6 +45,10 @@ spec:
           env:
             - name: KAFKA_BOOTSTRAP_SERVERS
               value: "kafka.kafka.svc.internal.lan:9092"
+            - name: KAFKA_CONNECTION_TIMEOUT_SECONDS
+              value: "600"
+            - name: KAFKA_RETRY_INTERVAL_SECONDS
+              value: "3"
             - name: KAFKA_REQUEST_TOPIC
               value: "graphql.async.requests.v1"
             - name: KAFKA_RESPONSE_TOPIC
@@ -106,19 +111,74 @@ spec:
                 CMD_CFG=(--command-config "${KAFKA_ADMIN_CLIENT_CONFIG_PATH}")
               fi
 
+              timeout_deadline=$(( $(date +%s) + KAFKA_CONNECTION_TIMEOUT_SECONDS ))
+
+              choose_bootstrap_server() {
+                local candidate trimmed host port
+                local -a servers=()
+                IFS=',' read -r -a servers <<< "${KAFKA_BOOTSTRAP_SERVERS}"
+
+                while true; do
+                  for candidate in "${servers[@]}"; do
+                    trimmed="$(echo "${candidate}" | xargs)"
+                    if [[ -z "${trimmed}" ]]; then
+                      continue
+                    fi
+
+                    host="${trimmed%:*}"
+                    port="${trimmed##*:}"
+                    if [[ -z "${host}" || -z "${port}" || "${host}" == "${port}" ]]; then
+                      continue
+                    fi
+
+                    if timeout 2 bash -lc "cat < /dev/null > /dev/tcp/${host}/${port}" 2>/dev/null; then
+                      echo "${trimmed}"
+                      return 0
+                    fi
+                  done
+
+                  if (( $(date +%s) >= timeout_deadline )); then
+                    return 1
+                  fi
+
+                  echo "Waiting for Kafka endpoints: ${KAFKA_BOOTSTRAP_SERVERS}..." >&2
+                  sleep "${KAFKA_RETRY_INTERVAL_SECONDS}"
+                done
+              }
+
+              KAFKA_ACTIVE_BOOTSTRAP="$(choose_bootstrap_server)" || {
+                echo "Timed out waiting for Kafka endpoints: ${KAFKA_BOOTSTRAP_SERVERS}" >&2
+                exit 1
+              }
+              echo "Using Kafka bootstrap server ${KAFKA_ACTIVE_BOOTSTRAP}"
+
               kafka_cli() {
                 local script="$1"
                 shift
-                "/opt/kafka/bin/${script}" --bootstrap-server "${KAFKA_BOOTSTRAP_SERVERS}" "${CMD_CFG[@]}" "$@"
+                "/opt/kafka/bin/${script}" --bootstrap-server "${KAFKA_ACTIVE_BOOTSTRAP}" "${CMD_CFG[@]}" "$@"
               }
 
-              until kafka_cli kafka-broker-api-versions.sh >/dev/null 2>&1; do
-                echo "Waiting for Kafka at ${KAFKA_BOOTSTRAP_SERVERS}..."
-                sleep 3
+              AUTH_OUTPUT=""
+              while true; do
+                if AUTH_OUTPUT="$(kafka_cli kafka-broker-api-versions.sh 2>&1)"; then
+                  break
+                fi
+
+                if (( $(date +%s) >= timeout_deadline )); then
+                  echo "Timed out waiting for authenticated Kafka access at ${KAFKA_ACTIVE_BOOTSTRAP}" >&2
+                  echo "${AUTH_OUTPUT}" >&2
+                  echo "Verify kafka-security-bootstrap has created SCRAM user ${KAFKA_ASYNC_USERNAME}" >&2
+                  exit 1
+                fi
+
+                echo "Waiting for authenticated Kafka access at ${KAFKA_ACTIVE_BOOTSTRAP}..."
+                sleep "${KAFKA_RETRY_INTERVAL_SECONDS}"
               done
 
               echo "Current topics:"
-              kafka_cli kafka-topics.sh --list | sort || true
+              if ! kafka_cli kafka-topics.sh --list | sort; then
+                echo "Unable to list topics with configured principal; continuing with topic reconciliation"
+              fi
 
               create_or_update_topic() {
                 local topic="$1"

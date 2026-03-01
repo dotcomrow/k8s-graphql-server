@@ -1,0 +1,203 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: graphql-kafka-setup
+  namespace: graphql
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: graphql-kafka-setup
+  namespace: graphql
+  annotations:
+    argocd.argoproj.io/sync-options: Replace=true,Force=true
+    argocd.argoproj.io/sync-wave: "2"
+    reloader.stakater.com/auto: "true"
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: graphql-kafka-setup
+      annotations:
+        linkerd.io/inject: "disabled"
+        reloader.stakater.com/auto: "true"
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "graphql-kafka-setup"
+        vault.hashicorp.com/agent-inject-secret-kafka-async-username: "secret/data/graphql-kafka-async-username"
+        vault.hashicorp.com/agent-inject-template-kafka-async-username: |
+          {{- with secret "secret/data/graphql-kafka-async-username" -}}
+          {{ .Data.data.value }}
+          {{- end }}
+        vault.hashicorp.com/agent-inject-secret-kafka-async-password: "secret/data/graphql-kafka-async-password"
+        vault.hashicorp.com/agent-inject-template-kafka-async-password: |
+          {{- with secret "secret/data/graphql-kafka-async-password" -}}
+          {{ .Data.data.value }}
+          {{- end }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: graphql-kafka-setup
+      containers:
+        - name: kafka-setup
+          image: apache/kafka:3.9.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: "kafka.kafka.svc.internal.lan:9092"
+            - name: KAFKA_REQUEST_TOPIC
+              value: "graphql.async.requests.v1"
+            - name: KAFKA_RESPONSE_TOPIC
+              value: "graphql.async.responses.v1"
+            - name: KAFKA_DLQ_TOPIC
+              value: "graphql.async.responses.dlq.v1"
+            - name: KAFKA_REQUEST_PARTITIONS
+              value: "6"
+            - name: KAFKA_RESPONSE_PARTITIONS
+              value: "6"
+            - name: KAFKA_DLQ_PARTITIONS
+              value: "3"
+            - name: KAFKA_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_REQUEST_RETENTION_MS
+              value: "604800000"
+            - name: KAFKA_RESPONSE_RETENTION_MS
+              value: "604800000"
+            - name: KAFKA_DLQ_RETENTION_MS
+              value: "1209600000"
+            - name: KAFKA_SCRAM_ITERATIONS
+              value: "4096"
+            - name: KAFKA_CONSUMER_GROUP
+              value: "graphql-async-workers"
+            - name: KAFKA_ADMIN_CLIENT_CONFIG_PATH
+              value: ""
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+
+              wait_for_file() {
+                local path="$1"
+                while [[ ! -s "$path" ]]; do
+                  echo "Waiting for $path..."
+                  sleep 2
+                done
+              }
+
+              wait_for_file /vault/secrets/kafka-async-username
+              wait_for_file /vault/secrets/kafka-async-password
+
+              KAFKA_ASYNC_USERNAME="$(tr -d '\r\n' < /vault/secrets/kafka-async-username)"
+              KAFKA_ASYNC_PASSWORD="$(tr -d '\r\n' < /vault/secrets/kafka-async-password)"
+
+              if [[ -z "${KAFKA_ASYNC_USERNAME}" || -z "${KAFKA_ASYNC_PASSWORD}" ]]; then
+                echo "Kafka async username/password must be populated in Vault" >&2
+                exit 1
+              fi
+
+              AUTO_CFG_PATH=/tmp/kafka-client.properties
+              cat > "${AUTO_CFG_PATH}" <<EOF
+              security.protocol=SASL_PLAINTEXT
+              sasl.mechanism=SCRAM-SHA-256
+              sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="${KAFKA_ASYNC_USERNAME}" password="${KAFKA_ASYNC_PASSWORD}";
+              EOF
+
+              CMD_CFG=(--command-config "${AUTO_CFG_PATH}")
+              if [[ -n "${KAFKA_ADMIN_CLIENT_CONFIG_PATH}" && -s "${KAFKA_ADMIN_CLIENT_CONFIG_PATH}" ]]; then
+                CMD_CFG=(--command-config "${KAFKA_ADMIN_CLIENT_CONFIG_PATH}")
+              fi
+
+              kafka_cli() {
+                local script="$1"
+                shift
+                "/opt/kafka/bin/${script}" --bootstrap-server "${KAFKA_BOOTSTRAP_SERVERS}" "${CMD_CFG[@]}" "$@"
+              }
+
+              until kafka_cli kafka-broker-api-versions.sh >/dev/null 2>&1; do
+                echo "Waiting for Kafka at ${KAFKA_BOOTSTRAP_SERVERS}..."
+                sleep 3
+              done
+
+              echo "Current topics:"
+              kafka_cli kafka-topics.sh --list | sort || true
+
+              create_or_update_topic() {
+                local topic="$1"
+                local partitions="$2"
+                local retention_ms="$3"
+
+                if kafka_cli kafka-topics.sh --describe --topic "${topic}" >/dev/null 2>&1; then
+                  echo "Topic exists: ${topic}"
+                else
+                  echo "Creating topic: ${topic}"
+                  kafka_cli kafka-topics.sh \
+                    --create \
+                    --if-not-exists \
+                    --topic "${topic}" \
+                    --partitions "${partitions}" \
+                    --replication-factor "${KAFKA_REPLICATION_FACTOR}"
+                fi
+
+                kafka_cli kafka-configs.sh \
+                  --alter \
+                  --entity-type topics \
+                  --entity-name "${topic}" \
+                  --add-config "retention.ms=${retention_ms},cleanup.policy=delete,min.insync.replicas=1"
+
+                kafka_cli kafka-topics.sh --describe --topic "${topic}"
+              }
+
+              create_or_update_topic "${KAFKA_REQUEST_TOPIC}" "${KAFKA_REQUEST_PARTITIONS}" "${KAFKA_REQUEST_RETENTION_MS}"
+              create_or_update_topic "${KAFKA_RESPONSE_TOPIC}" "${KAFKA_RESPONSE_PARTITIONS}" "${KAFKA_RESPONSE_RETENTION_MS}"
+              create_or_update_topic "${KAFKA_DLQ_TOPIC}" "${KAFKA_DLQ_PARTITIONS}" "${KAFKA_DLQ_RETENTION_MS}"
+
+              echo "Ensuring SCRAM credentials for user ${KAFKA_ASYNC_USERNAME}"
+              SCRAM_OUTPUT=""
+              if ! SCRAM_OUTPUT="$(kafka_cli kafka-configs.sh \
+                --alter \
+                --entity-type users \
+                --entity-name "${KAFKA_ASYNC_USERNAME}" \
+                --add-config "SCRAM-SHA-256=[iterations=${KAFKA_SCRAM_ITERATIONS},password=${KAFKA_ASYNC_PASSWORD}]" 2>&1)"; then
+                if grep -Eqi "AuthorizationException|Not authorized|ClusterAuthorizationException" <<<"${SCRAM_OUTPUT}"; then
+                  echo "Configured Kafka principal cannot alter user SCRAM credentials; skipping credential alter"
+                else
+                  echo "${SCRAM_OUTPUT}" >&2
+                  exit 1
+                fi
+              fi
+
+              kafka_cli kafka-configs.sh \
+                --describe \
+                --entity-type users \
+                --entity-name "${KAFKA_ASYNC_USERNAME}" >/dev/null 2>&1 || true
+
+              ACL_LIST_OUTPUT=""
+              if ACL_LIST_OUTPUT="$(kafka_cli kafka-acls.sh --list 2>&1)"; then
+                ACLS_ENABLED="true"
+              elif grep -q "SecurityDisabledException" <<<"${ACL_LIST_OUTPUT}"; then
+                ACLS_ENABLED="false"
+                echo "Kafka authorizer is disabled; skipping ACL creation"
+              elif grep -Eqi "AuthorizationException|Not authorized|ClusterAuthorizationException|TopicAuthorizationException|GroupAuthorizationException" <<<"${ACL_LIST_OUTPUT}"; then
+                ACLS_ENABLED="false"
+                echo "Configured Kafka principal cannot manage ACLs; skipping ACL creation"
+              else
+                echo "Failed to list ACLs" >&2
+                echo "${ACL_LIST_OUTPUT}" >&2
+                exit 1
+              fi
+
+              if [[ "${ACLS_ENABLED}" == "true" ]]; then
+                add_acl() {
+                  kafka_cli kafka-acls.sh \
+                    --add \
+                    --allow-principal "User:${KAFKA_ASYNC_USERNAME}" \
+                    "$@"
+                }
+
+                add_acl --topic "${KAFKA_REQUEST_TOPIC}" --operation Read --operation Write --operation Describe
+                add_acl --topic "${KAFKA_RESPONSE_TOPIC}" --operation Read --operation Write --operation Describe
+                add_acl --topic "${KAFKA_DLQ_TOPIC}" --operation Read --operation Write --operation Describe
+                add_acl --group "${KAFKA_CONSUMER_GROUP}" --operation Read --operation Describe
+                kafka_cli kafka-acls.sh --list
+              fi
+
+              echo "Kafka async setup complete"

@@ -23,6 +23,53 @@ Notes:
 - Secrets/connection strings are intentionally left commented out because the file is stored in a ConfigMap. This repo currently injects `HASURA_GRAPHQL_DATABASE_URL` and `HASURA_GRAPHQL_ADMIN_SECRET` via Vault in `manifests/hasura.yaml`.
 - Redis connection env vars (`HASURA_GRAPHQL_*_REDIS_*`) are configured via Vault injection in `manifests/hasura.yaml` and are intentionally omitted from the generated ConfigMap to avoid accidental override.
 
+## Async Kafka Bridge
+This repo includes idempotent bootstrap jobs for the async GraphQL + Kafka flow:
+
+- `manifests/graphql-async-bootstrap.yaml`
+  - Creates/updates table `graphql.client_async_messages` in the Hasura DB.
+  - Tracks the table in Hasura metadata.
+  - Creates Hasura permissions for roles `user` and `service`.
+- `manifests/graphql-kafka-setup.yaml`
+  - Inspects existing Kafka state.
+  - Creates/updates async topics:
+    - `graphql.async.requests.v1`
+    - `graphql.async.responses.v1`
+    - `graphql.async.responses.dlq.v1`
+  - Uses Kafka credentials from Vault paths:
+    - `secret/data/graphql-kafka-async-username` (`value`)
+    - `secret/data/graphql-kafka-async-password` (`value`)
+  - Authenticates to Kafka with `SASL_PLAINTEXT` + `SCRAM-SHA-256` on `kafka.kafka.svc.internal.lan:9092`.
+  - Applies ACLs if Kafka authorizer is enabled (skips ACL creation when broker security/authorizer is disabled).
+- `manifests/graphql-async-response-writer.yaml`
+  - Runs a long-lived consumer (`Deployment`) on topic `graphql.async.responses.v1`.
+  - Authenticates to Kafka using the same Vault-managed async principal.
+  - Writes service responses idempotently into `graphql.client_async_messages` by `request_id`.
+  - Sends permanently invalid response messages (for example invalid JSON/missing `request_id`) to `graphql.async.responses.dlq.v1`.
+
+Vault role/policy for the Kafka setup job are created by:
+- `manifests/00-vault-yugabyte-init.yaml`
+
+### Verify async bootstrap
+```sh
+kubectl -n graphql get job graphql-async-bootstrap graphql-kafka-setup
+kubectl -n graphql get deploy graphql-async-response-writer
+kubectl -n graphql logs job/graphql-async-bootstrap --tail=200
+kubectl -n graphql logs job/graphql-kafka-setup --tail=200
+kubectl -n graphql logs deploy/graphql-async-response-writer --tail=200
+```
+
+Verify Hasura now exposes subscriptions (subscription root becomes non-null once a table is tracked):
+```sh
+kubectl -n graphql exec deploy/graphql-gravitee-sync -c sync -- python3 -c \
+'import json,urllib.request;admin=open(\"/vault/secrets/hasura-admin\").read().strip();q={\"query\":\"query{ __schema { subscriptionType { name } } }\"};req=urllib.request.Request(\"http://hasura.graphql.svc.cluster.local:8080/v1/graphql\",data=json.dumps(q).encode(),headers={\"Content-Type\":\"application/json\",\"X-Hasura-Admin-Secret\":admin},method=\"POST\");print(urllib.request.urlopen(req,timeout=20).read().decode())'
+```
+
+Verify topics on broker:
+```sh
+kubectl -n kafka exec kafka-0 -- /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka.kafka.svc.internal.lan:9092 --list | sort
+```
+
 ## Cloudflare Tunnel
 This repo includes a Cloudflare Tunnel deployment at `manifests/cloudflare-tunnel.yaml`.
 It runs `cloudflared` in the `graphql` namespace and reads `TUNNEL_TOKEN` from a Kubernetes Secret named `cloudflare-tunnel-token`.
@@ -64,6 +111,8 @@ Argo sync order is set with sync-wave annotations so Vault role/policy and Secre
    - Example hostname: `cf-suncoast-graphql-proxy.dev.suncoast.systems`
    - Service URL: `http://hasura.graphql.svc.cluster.local:8080`
    - Restrict the public route to `/v1/graphql` and `/v1/graphql/*`.
+   - Keep WebSocket upgrades enabled for this hostname/path (required for GraphQL subscriptions).
+   - Disable caching on the GraphQL path.
 
 No APISIX route is required for public Hasura ingress in this setup; Cloudflare Tunnel is the only external entrypoint.
 

@@ -266,11 +266,11 @@ data:
 
     # HASURA_GRAPHQL_WEBSOCKET_CONNECTION_INIT_TIMEOUT
     # Control websocket connection_init timeout (default 3 seconds)
-    # HASURA_GRAPHQL_WEBSOCKET_CONNECTION_INIT_TIMEOUT=
+    HASURA_GRAPHQL_WEBSOCKET_CONNECTION_INIT_TIMEOUT='10'
 
     # HASURA_GRAPHQL_WEBSOCKET_KEEPALIVE
     # Control websocket keep-alive timeout (default 5 seconds)
-    # HASURA_GRAPHQL_WEBSOCKET_KEEPALIVE=
+    HASURA_GRAPHQL_WEBSOCKET_KEEPALIVE='25'
 
     # HASURA_GRAPHQL_WS_READ_COOKIE
     # Read cookie on WebSocket initial handshake, even when CORS is disabled. This can be a

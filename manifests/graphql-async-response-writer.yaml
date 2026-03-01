@@ -1,0 +1,542 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: graphql-async-response-writer
+  namespace: graphql
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: graphql-async-response-writer
+  namespace: graphql
+data:
+  writer.py: |
+    #!/usr/bin/env python3
+    import json
+    import os
+    import signal
+    import time
+    import traceback
+    from datetime import datetime, timezone
+
+    import psycopg
+    from kafka import KafkaConsumer, KafkaProducer
+    from kafka.structs import OffsetAndMetadata, TopicPartition
+
+    KAFKA_BOOTSTRAP_SERVERS = [
+      item.strip()
+      for item in os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka.kafka.svc.internal.lan:9092").split(",")
+      if item.strip()
+    ]
+    KAFKA_RESPONSE_TOPIC = os.environ.get("KAFKA_RESPONSE_TOPIC", "graphql.async.responses.v1")
+    KAFKA_DLQ_TOPIC = os.environ.get("KAFKA_DLQ_TOPIC", "graphql.async.responses.dlq.v1").strip()
+    KAFKA_CONSUMER_GROUP = os.environ.get("KAFKA_CONSUMER_GROUP", "graphql-async-workers")
+    KAFKA_AUTO_OFFSET_RESET = os.environ.get("KAFKA_AUTO_OFFSET_RESET", "earliest")
+
+    KAFKA_USERNAME_PATH = os.environ.get("KAFKA_USERNAME_PATH", "/vault/secrets/kafka-async-username")
+    KAFKA_PASSWORD_PATH = os.environ.get("KAFKA_PASSWORD_PATH", "/vault/secrets/kafka-async-password")
+    DB_URL_PATH = os.environ.get("DB_URL_PATH", "/vault/secrets/db-url")
+
+    POLL_TIMEOUT_MS = int(os.environ.get("POLL_TIMEOUT_MS", "1000"))
+    RECONNECT_BACKOFF_SECONDS = int(os.environ.get("RECONNECT_BACKOFF_SECONDS", "5"))
+    LOG_EVERY_MESSAGES = int(os.environ.get("LOG_EVERY_MESSAGES", "100"))
+    HEARTBEAT_PATH = os.environ.get("HEARTBEAT_PATH", "/tmp/health/heartbeat")
+
+    RUNNING = True
+
+    UPDATE_SQL = """
+    UPDATE graphql.client_async_messages
+    SET
+      status = %s,
+      response_payload = COALESCE(%s::jsonb, response_payload),
+      error_payload = COALESCE(%s::jsonb, error_payload),
+      kafka_topic = %s,
+      kafka_partition = %s,
+      kafka_offset = %s,
+      metadata = COALESCE(metadata, '{}'::jsonb) || COALESCE(%s::jsonb, '{}'::jsonb),
+      completed_at = COALESCE(%s::timestamptz, completed_at),
+      expires_at = COALESCE(%s::timestamptz, expires_at),
+      updated_at = NOW()
+    WHERE request_id = %s
+    RETURNING id
+    """
+
+    INSERT_SQL = """
+    INSERT INTO graphql.client_async_messages (
+      request_id,
+      client_id,
+      status,
+      response_payload,
+      error_payload,
+      kafka_topic,
+      kafka_partition,
+      kafka_offset,
+      metadata,
+      completed_at,
+      expires_at
+    ) VALUES (
+      %s,
+      %s,
+      %s,
+      %s::jsonb,
+      %s::jsonb,
+      %s,
+      %s,
+      %s,
+      %s::jsonb,
+      %s::timestamptz,
+      %s::timestamptz
+    )
+    ON CONFLICT (request_id) DO UPDATE
+    SET
+      status = EXCLUDED.status,
+      response_payload = COALESCE(EXCLUDED.response_payload, graphql.client_async_messages.response_payload),
+      error_payload = COALESCE(EXCLUDED.error_payload, graphql.client_async_messages.error_payload),
+      kafka_topic = EXCLUDED.kafka_topic,
+      kafka_partition = EXCLUDED.kafka_partition,
+      kafka_offset = EXCLUDED.kafka_offset,
+      metadata = COALESCE(graphql.client_async_messages.metadata, '{}'::jsonb) || COALESCE(EXCLUDED.metadata, '{}'::jsonb),
+      completed_at = COALESCE(EXCLUDED.completed_at, graphql.client_async_messages.completed_at),
+      expires_at = COALESCE(EXCLUDED.expires_at, graphql.client_async_messages.expires_at),
+      updated_at = NOW()
+    RETURNING id
+    """
+
+
+    class PermanentMessageError(Exception):
+      def __init__(self, reason, detail=None):
+        super().__init__(reason)
+        self.reason = reason
+        self.detail = detail or {}
+
+
+    def log(message):
+      now = datetime.now(timezone.utc).isoformat()
+      print(f"[{now}] {message}", flush=True)
+
+
+    def signal_handler(signum, _frame):
+      global RUNNING
+      RUNNING = False
+      log(f"Received signal {signum}, shutting down")
+
+
+    def wait_for_file(path):
+      while RUNNING:
+        if os.path.isfile(path) and os.path.getsize(path) > 0:
+          return
+        log(f"Waiting for secret file {path}")
+        time.sleep(2)
+      raise RuntimeError("Stopped while waiting for secret files")
+
+
+    def read_secret(path, name):
+      wait_for_file(path)
+      with open(path, "r", encoding="utf-8") as handle:
+        value = handle.read().strip()
+      if not value:
+        raise RuntimeError(f"{name} is empty at {path}")
+      return value
+
+
+    def decode_bytes(value):
+      if value is None:
+        return ""
+      if isinstance(value, (bytes, bytearray)):
+        return value.decode("utf-8", errors="replace")
+      return str(value)
+
+
+    def json_text(value):
+      if value is None:
+        return None
+      return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+
+
+    def parse_timestamp(value):
+      if value is None:
+        return None
+      if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+      if isinstance(value, str):
+        text = value.strip()
+        if not text:
+          return None
+        if text.endswith("Z"):
+          text = text[:-1] + "+00:00"
+        try:
+          parsed = datetime.fromisoformat(text)
+        except ValueError:
+          return None
+        if parsed.tzinfo is None:
+          parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+      return None
+
+
+    def write_heartbeat():
+      if not HEARTBEAT_PATH:
+        return
+      directory = os.path.dirname(HEARTBEAT_PATH)
+      if directory:
+        os.makedirs(directory, exist_ok=True)
+      with open(HEARTBEAT_PATH, "w", encoding="utf-8") as handle:
+        handle.write(str(int(time.time())))
+
+
+    def build_consumer(username, password):
+      consumer = KafkaConsumer(
+        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+        group_id=KAFKA_CONSUMER_GROUP,
+        enable_auto_commit=False,
+        auto_offset_reset=KAFKA_AUTO_OFFSET_RESET,
+        security_protocol="SASL_PLAINTEXT",
+        sasl_mechanism="SCRAM-SHA-256",
+        sasl_plain_username=username,
+        sasl_plain_password=password,
+        request_timeout_ms=30000,
+        session_timeout_ms=10000,
+        heartbeat_interval_ms=3000,
+        max_poll_records=1,
+        consumer_timeout_ms=1000,
+      )
+      consumer.subscribe([KAFKA_RESPONSE_TOPIC])
+      return consumer
+
+
+    def build_producer(username, password):
+      if not KAFKA_DLQ_TOPIC:
+        return None
+      return KafkaProducer(
+        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+        security_protocol="SASL_PLAINTEXT",
+        sasl_mechanism="SCRAM-SHA-256",
+        sasl_plain_username=username,
+        sasl_plain_password=password,
+        acks="all",
+        retries=5,
+        linger_ms=20,
+      )
+
+
+    def parse_message(message):
+      raw_value = decode_bytes(message.value).strip()
+      if not raw_value:
+        raise PermanentMessageError("empty_payload", {})
+      try:
+        payload = json.loads(raw_value)
+      except json.JSONDecodeError as exc:
+        raise PermanentMessageError(
+          "invalid_json",
+          {"error": str(exc), "payload_preview": raw_value[:2048]},
+        ) from exc
+      if not isinstance(payload, dict):
+        raise PermanentMessageError(
+          "invalid_payload_type",
+          {"payload_preview": raw_value[:2048]},
+        )
+
+      request_id = str(payload.get("request_id") or decode_bytes(message.key)).strip()
+      if not request_id:
+        raise PermanentMessageError(
+          "missing_request_id",
+          {"payload_preview": raw_value[:2048]},
+        )
+
+      client_id = payload.get("client_id")
+      if client_id is not None:
+        client_id = str(client_id).strip() or None
+
+      status = payload.get("status")
+      if isinstance(status, str) and status.strip():
+        status = status.strip().lower()
+      elif payload.get("error_payload") is not None or payload.get("error") is not None:
+        status = "error"
+      else:
+        status = "completed"
+
+      response_payload = payload.get("response_payload", payload.get("response"))
+      error_payload = payload.get("error_payload", payload.get("error"))
+
+      metadata = payload.get("metadata")
+      if not isinstance(metadata, dict):
+        metadata = {}
+      metadata["source_topic"] = message.topic
+      metadata["source_partition"] = message.partition
+      metadata["source_offset"] = message.offset
+      metadata["ingested_by"] = "graphql-async-response-writer"
+
+      completed_at = parse_timestamp(payload.get("completed_at"))
+      if completed_at is None and status in ("completed", "error"):
+        completed_at = datetime.now(timezone.utc)
+      expires_at = parse_timestamp(payload.get("expires_at"))
+
+      return {
+        "request_id": request_id,
+        "client_id": client_id,
+        "status": status,
+        "response_payload": response_payload,
+        "error_payload": error_payload,
+        "metadata": metadata,
+        "completed_at": completed_at,
+        "expires_at": expires_at,
+      }
+
+
+    def upsert_response(conn, record, message):
+      response_payload = json_text(record["response_payload"])
+      error_payload = json_text(record["error_payload"])
+      metadata = json_text(record["metadata"] or {})
+
+      with conn.cursor() as cur:
+        cur.execute(
+          UPDATE_SQL,
+          (
+            record["status"],
+            response_payload,
+            error_payload,
+            message.topic,
+            message.partition,
+            message.offset,
+            metadata,
+            record["completed_at"],
+            record["expires_at"],
+            record["request_id"],
+          ),
+        )
+        if cur.fetchone():
+          return "updated"
+
+        if not record["client_id"]:
+          return "missing_client_id"
+
+        cur.execute(
+          INSERT_SQL,
+          (
+            record["request_id"],
+            record["client_id"],
+            record["status"],
+            response_payload,
+            error_payload,
+            message.topic,
+            message.partition,
+            message.offset,
+            metadata,
+            record["completed_at"],
+            record["expires_at"],
+          ),
+        )
+        cur.fetchone()
+        return "inserted"
+
+
+    def commit_message(consumer, message):
+      topic_partition = TopicPartition(message.topic, message.partition)
+      consumer.commit({topic_partition: OffsetAndMetadata(message.offset + 1, "")})
+
+
+    def send_to_dlq(producer, message, reason, detail):
+      if producer is None:
+        return
+      detail = detail or {}
+      request_id = ""
+      if isinstance(detail, dict):
+        request_id = str(detail.get("request_id") or "").strip()
+      key_text = request_id or decode_bytes(message.key).strip()
+      payload = {
+        "reason": reason,
+        "detail": detail,
+        "source_topic": message.topic,
+        "source_partition": message.partition,
+        "source_offset": message.offset,
+        "original_key": decode_bytes(message.key),
+        "original_value": decode_bytes(message.value),
+        "processed_at": datetime.now(timezone.utc).isoformat(),
+      }
+      value_bytes = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+      key_bytes = key_text.encode("utf-8") if key_text else None
+      producer.send(KAFKA_DLQ_TOPIC, key=key_bytes, value=value_bytes).get(timeout=10)
+
+
+    def close_quietly(resource, name):
+      if resource is None:
+        return
+      try:
+        resource.close()
+      except Exception as exc:
+        log(f"Failed to close {name}: {exc}")
+
+
+    def run_once(username, password, db_url):
+      connection = None
+      consumer = None
+      producer = None
+      processed = 0
+      try:
+        connection = psycopg.connect(db_url, connect_timeout=10)
+        connection.autocommit = False
+        consumer = build_consumer(username, password)
+        producer = build_producer(username, password)
+        log(
+          "Response writer started "
+          f"bootstrap={','.join(KAFKA_BOOTSTRAP_SERVERS)} "
+          f"topic={KAFKA_RESPONSE_TOPIC} "
+          f"group={KAFKA_CONSUMER_GROUP}"
+        )
+        while RUNNING:
+          write_heartbeat()
+          batches = consumer.poll(timeout_ms=POLL_TIMEOUT_MS, max_records=1)
+          if not batches:
+            continue
+          for _, messages in batches.items():
+            for message in messages:
+              try:
+                record = parse_message(message)
+                action = upsert_response(connection, record, message)
+                if action == "missing_client_id":
+                  raise PermanentMessageError(
+                    "missing_client_id_for_new_request",
+                    {"request_id": record["request_id"]},
+                  )
+
+                connection.commit()
+                commit_message(consumer, message)
+                processed += 1
+                if processed % LOG_EVERY_MESSAGES == 0:
+                  log(f"Processed {processed} messages from {KAFKA_RESPONSE_TOPIC}")
+              except PermanentMessageError as exc:
+                connection.rollback()
+                send_to_dlq(producer, message, exc.reason, exc.detail)
+                commit_message(consumer, message)
+                log(
+                  "Skipping message with permanent error "
+                  f"topic={message.topic} partition={message.partition} offset={message.offset} reason={exc.reason}"
+                )
+              except Exception:
+                connection.rollback()
+                raise
+      finally:
+        close_quietly(connection, "database connection")
+        close_quietly(consumer, "kafka consumer")
+        close_quietly(producer, "kafka producer")
+
+
+    def main():
+      signal.signal(signal.SIGTERM, signal_handler)
+      signal.signal(signal.SIGINT, signal_handler)
+
+      wait_for_file(KAFKA_USERNAME_PATH)
+      wait_for_file(KAFKA_PASSWORD_PATH)
+      wait_for_file(DB_URL_PATH)
+
+      while RUNNING:
+        try:
+          kafka_username = read_secret(KAFKA_USERNAME_PATH, "Kafka username")
+          kafka_password = read_secret(KAFKA_PASSWORD_PATH, "Kafka password")
+          db_url = read_secret(DB_URL_PATH, "database URL")
+          run_once(kafka_username, kafka_password, db_url)
+        except Exception as exc:
+          if not RUNNING:
+            break
+          log(f"Writer loop failed: {exc}")
+          traceback.print_exc()
+          time.sleep(RECONNECT_BACKOFF_SECONDS)
+
+
+    if __name__ == "__main__":
+      main()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: graphql-async-response-writer
+  namespace: graphql
+  annotations:
+    argocd.argoproj.io/sync-wave: "4"
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: graphql-async-response-writer
+  template:
+    metadata:
+      labels:
+        app: graphql-async-response-writer
+      annotations:
+        linkerd.io/inject: "disabled"
+        reloader.stakater.com/auto: "true"
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "graphql-async-response-writer"
+        vault.hashicorp.com/agent-inject-secret-kafka-async-username: "secret/data/graphql-kafka-async-username"
+        vault.hashicorp.com/agent-inject-template-kafka-async-username: |
+          {{- with secret "secret/data/graphql-kafka-async-username" -}}
+          {{ .Data.data.value }}
+          {{- end }}
+        vault.hashicorp.com/agent-inject-secret-kafka-async-password: "secret/data/graphql-kafka-async-password"
+        vault.hashicorp.com/agent-inject-template-kafka-async-password: |
+          {{- with secret "secret/data/graphql-kafka-async-password" -}}
+          {{ .Data.data.value }}
+          {{- end }}
+        vault.hashicorp.com/agent-inject-secret-db-url: "yugabyte-db/static-creds/graphql-yb-admin"
+        vault.hashicorp.com/agent-inject-template-db-url: |
+          {{- with secret "yugabyte-db/static-creds/graphql-yb-admin" -}}
+          postgresql://{{ .Data.username }}:{{ .Data.password }}@yb-tserver-service.yugabyte.svc.cluster.local:5433/hasura?sslmode=disable
+          {{- end }}
+    spec:
+      serviceAccountName: graphql-async-response-writer
+      containers:
+        - name: writer
+          image: python:3.12-slim
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: "kafka.kafka.svc.internal.lan:9092"
+            - name: KAFKA_RESPONSE_TOPIC
+              value: "graphql.async.responses.v1"
+            - name: KAFKA_DLQ_TOPIC
+              value: "graphql.async.responses.dlq.v1"
+            - name: KAFKA_CONSUMER_GROUP
+              value: "graphql-async-workers"
+            - name: KAFKA_AUTO_OFFSET_RESET
+              value: "earliest"
+            - name: KAFKA_USERNAME_PATH
+              value: "/vault/secrets/kafka-async-username"
+            - name: KAFKA_PASSWORD_PATH
+              value: "/vault/secrets/kafka-async-password"
+            - name: DB_URL_PATH
+              value: "/vault/secrets/db-url"
+            - name: POLL_TIMEOUT_MS
+              value: "1000"
+            - name: RECONNECT_BACKOFF_SECONDS
+              value: "5"
+            - name: LOG_EVERY_MESSAGES
+              value: "100"
+            - name: HEARTBEAT_PATH
+              value: "/tmp/health/heartbeat"
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              set -euo pipefail
+              pip install --no-cache-dir --disable-pip-version-check \
+                "kafka-python>=2.0.2,<3.0.0" \
+                "psycopg[binary]>=3.1.0,<4.0.0"
+              exec python /opt/config/writer.py
+          volumeMounts:
+            - name: writer-config
+              mountPath: /opt/config
+              readOnly: true
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+      volumes:
+        - name: writer-config
+          configMap:
+            name: graphql-async-response-writer
+            defaultMode: 0555

@@ -427,6 +427,28 @@ spec:
                 policies="graphql-gravitee-sync" \
                 ttl="48h"
 
+              vault policy write "graphql-kafka-setup" - <<'EOF'
+              path "secret/data/graphql-kafka-async-username" { capabilities = ["read"] }
+              path "secret/data/graphql-kafka-async-password" { capabilities = ["read"] }
+              EOF
+
+              vault write auth/${AUTH_PATH}/role/graphql-kafka-setup \
+                bound_service_account_names="graphql-kafka-setup" \
+                bound_service_account_namespaces="graphql" \
+                policies="graphql-kafka-setup" \
+                ttl="48h"
+
+              vault policy write "graphql-async-response-writer" - <<'EOF'
+              path "secret/data/graphql-kafka-async-username" { capabilities = ["read"] }
+              path "secret/data/graphql-kafka-async-password" { capabilities = ["read"] }
+              EOF
+
+              vault write auth/${AUTH_PATH}/role/graphql-async-response-writer \
+                bound_service_account_names="graphql-async-response-writer" \
+                bound_service_account_namespaces="graphql" \
+                policies="graphql-async-response-writer,${ROLE_STATIC_ADMIN}" \
+                ttl="48h"
+
               CREDS_JSON="$(vault read -format=json ${DB_MOUNT}/static-creds/${ROLE_STATIC_ADMIN})"
               DB_USER="$(printf '%s' "$CREDS_JSON" | jq -r .data.username)"
               DB_PASS="$(printf '%s' "$CREDS_JSON" | jq -r .data.password)"

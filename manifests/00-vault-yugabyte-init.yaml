@@ -449,6 +449,12 @@ spec:
                 policies="graphql-async-response-writer,${ROLE_STATIC_ADMIN}" \
                 ttl="48h"
 
+              vault write auth/${AUTH_PATH}/role/graphql-async-cleanup \
+                bound_service_account_names="graphql-async-cleanup" \
+                bound_service_account_namespaces="graphql" \
+                policies="${ROLE_STATIC_ADMIN}" \
+                ttl="48h"
+
               CREDS_JSON="$(vault read -format=json ${DB_MOUNT}/static-creds/${ROLE_STATIC_ADMIN})"
               DB_USER="$(printf '%s' "$CREDS_JSON" | jq -r .data.username)"
               DB_PASS="$(printf '%s' "$CREDS_JSON" | jq -r .data.password)"

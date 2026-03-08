@@ -115,6 +115,8 @@ spec:
 
               CREATE INDEX IF NOT EXISTS client_async_messages_client_status_created_idx
                 ON graphql.client_async_messages (client_id, status, created_at DESC);
+              CREATE INDEX IF NOT EXISTS client_async_messages_status_created_idx
+                ON graphql.client_async_messages (status, created_at);
               CREATE INDEX IF NOT EXISTS client_async_messages_request_id_idx
                 ON graphql.client_async_messages (request_id);
               CREATE INDEX IF NOT EXISTS client_async_messages_expires_at_idx

@@ -46,6 +46,10 @@ This repo includes idempotent bootstrap jobs for the async GraphQL + Kafka flow:
   - Authenticates to Kafka using the same Vault-managed async principal.
   - Writes service responses idempotently into `graphql.client_async_messages` by `request_id`.
   - Sends permanently invalid response messages (for example invalid JSON/missing `request_id`) to `graphql.async.responses.dlq.v1`.
+- `manifests/graphql-async-cleanup.yaml`
+  - Runs a scheduled cleanup (`CronJob`) every 10 minutes.
+  - Deletes expired rows from `graphql.client_async_messages` where `expires_at < NOW()`.
+  - Deletes in batches to avoid large one-shot transactions.
 
 Vault role/policy for the Kafka setup job are created by:
 - `manifests/00-vault-yugabyte-init.yaml`
@@ -54,9 +58,11 @@ Vault role/policy for the Kafka setup job are created by:
 ```sh
 kubectl -n graphql get job graphql-async-bootstrap graphql-kafka-setup
 kubectl -n graphql get deploy graphql-async-response-writer
+kubectl -n graphql get cronjob graphql-async-cleanup
 kubectl -n graphql logs job/graphql-async-bootstrap --tail=200
 kubectl -n graphql logs job/graphql-kafka-setup --tail=200
 kubectl -n graphql logs deploy/graphql-async-response-writer --tail=200
+kubectl -n graphql get job --sort-by=.metadata.creationTimestamp | tail -n 5
 ```
 
 Verify Hasura now exposes subscriptions (subscription root becomes non-null once a table is tracked):

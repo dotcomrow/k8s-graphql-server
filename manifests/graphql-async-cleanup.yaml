@@ -1,0 +1,113 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: graphql-async-cleanup
+  namespace: graphql
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: graphql-async-cleanup
+  namespace: graphql
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+    reloader.stakater.com/auto: "true"
+spec:
+  schedule: "*/10 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            app: graphql-async-cleanup
+          annotations:
+            linkerd.io/inject: "disabled"
+            reloader.stakater.com/auto: "true"
+            vault.hashicorp.com/agent-inject: "true"
+            vault.hashicorp.com/agent-pre-populate-only: "true"
+            vault.hashicorp.com/role: "graphql"
+            vault.hashicorp.com/agent-inject-secret-db-url: "yugabyte-db/static-creds/graphql-yb-admin"
+            vault.hashicorp.com/agent-inject-template-db-url: |
+              {{- with secret "yugabyte-db/static-creds/graphql-yb-admin" -}}
+              postgresql://{{ .Data.username }}:{{ .Data.password }}@yb-tserver-service.yugabyte.svc.cluster.local:5433/hasura?sslmode=disable
+              {{- end }}
+        spec:
+          restartPolicy: Never
+          serviceAccountName: graphql-async-cleanup
+          containers:
+            - name: cleanup
+              image: postgres:15-alpine
+              imagePullPolicy: IfNotPresent
+              env:
+                - name: CLEANUP_BATCH_SIZE
+                  value: "1000"
+                - name: CLEANUP_MAX_BATCHES
+                  value: "100"
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+
+                  wait_for_file() {
+                    path="$1"
+                    while [ ! -s "$path" ]; do
+                      echo "Waiting for $path..."
+                      sleep 2
+                    done
+                  }
+
+                  wait_for_file /vault/secrets/db-url
+                  DB_URL="$(cat /vault/secrets/db-url)"
+
+                  table_exists="$(psql "${DB_URL}" -v ON_ERROR_STOP=1 -tA <<'SQL'
+                  SELECT to_regclass('graphql.client_async_messages') IS NOT NULL;
+                  SQL
+                  )"
+                  table_exists="$(echo "${table_exists}" | tr -d '[:space:]')"
+                  if [ "${table_exists}" != "t" ]; then
+                    echo "graphql.client_async_messages not found; skipping cleanup"
+                    exit 0
+                  fi
+
+                  batch_size="${CLEANUP_BATCH_SIZE:-1000}"
+                  max_batches="${CLEANUP_MAX_BATCHES:-100}"
+                  total_deleted=0
+                  batch_num=0
+
+                  while [ "${batch_num}" -lt "${max_batches}" ]; do
+                    deleted="$(psql "${DB_URL}" -v ON_ERROR_STOP=1 -v BATCH_SIZE="${batch_size}" -tA <<'SQL'
+                    WITH doomed AS (
+                      SELECT ctid
+                      FROM graphql.client_async_messages
+                      WHERE expires_at IS NOT NULL
+                        AND expires_at < NOW()
+                      ORDER BY expires_at
+                      LIMIT :BATCH_SIZE
+                    ),
+                    deleted AS (
+                      DELETE FROM graphql.client_async_messages AS m
+                      USING doomed
+                      WHERE m.ctid = doomed.ctid
+                      RETURNING 1
+                    )
+                    SELECT COUNT(*) FROM deleted;
+                    SQL
+                    )"
+                    deleted="$(echo "${deleted:-0}" | tr -d '[:space:]')"
+                    if [ -z "${deleted}" ]; then
+                      deleted=0
+                    fi
+
+                    total_deleted=$((total_deleted + deleted))
+                    batch_num=$((batch_num + 1))
+
+                    if [ "${deleted}" -lt "${batch_size}" ]; then
+                      break
+                    fi
+                  done
+
+                  echo "Deleted ${total_deleted} expired row(s) from graphql.client_async_messages in ${batch_num} batch(es)"

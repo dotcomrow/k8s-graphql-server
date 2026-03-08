@@ -39,6 +39,8 @@ spec:
           env:
             - name: HASURA_URL
               value: "http://hasura.graphql.svc.cluster.local:8080"
+            - name: ASYNC_REQUEST_ACTION_HANDLER_URL
+              value: "http://graphql-async-request-publisher.graphql.svc.cluster.local:8080/action/publish_async_request"
           command: ["/bin/sh", "-c"]
           args:
             - |
@@ -78,6 +80,33 @@ spec:
                   | select(.table.schema == "graphql" and .table.name == "client_async_messages")
                   | (.[$kind] // [])[]?
                   | select(.role == $role)
+                ' /tmp/metadata.json >/dev/null
+              }
+
+              action_exists() {
+                action_name="$1"
+                jq -e --arg action_name "${action_name}" '
+                  (.actions // [])[]?
+                  | select(.name == $action_name)
+                ' /tmp/metadata.json >/dev/null
+              }
+
+              action_permission_exists() {
+                action_name="$1"
+                role="$2"
+                jq -e --arg action_name "${action_name}" --arg role "${role}" '
+                  (.actions // [])[]?
+                  | select(.name == $action_name)
+                  | (.permissions // [])[]?
+                  | select(.role == $role)
+                ' /tmp/metadata.json >/dev/null
+              }
+
+              custom_scalar_exists() {
+                scalar_name="$1"
+                jq -e --arg scalar_name "${scalar_name}" '
+                  (.custom_types.scalars // [])[]?
+                  | select(.name == $scalar_name)
                 ' /tmp/metadata.json >/dev/null
               }
 
@@ -277,6 +306,65 @@ spec:
                   }
                 }')"
                 metadata_post "${SERVICE_UPDATE_PAYLOAD}"
+              fi
+
+              if ! custom_scalar_exists "json"; then
+                SET_CUSTOM_TYPES_PAYLOAD="$(jq -n \
+                  --argjson custom_types "$(jq '
+                    (.custom_types // {})
+                    | .scalars = (((.scalars // []) + [{"name":"json"}]) | unique_by(.name))
+                  ' /tmp/metadata.json)" '{
+                    type: "set_custom_types",
+                    args: $custom_types
+                  }')"
+                metadata_post "${SET_CUSTOM_TYPES_PAYLOAD}"
+              fi
+
+              if ! action_exists "publish_async_request"; then
+                CREATE_ACTION_PAYLOAD="$(jq -n \
+                  --arg handler "${ASYNC_REQUEST_ACTION_HANDLER_URL}" '{
+                    type: "create_action",
+                    args: {
+                      name: "publish_async_request",
+                      definition: {
+                        type: "mutation",
+                        kind: "synchronous",
+                        handler: $handler,
+                        timeout: 30,
+                        forward_client_headers: true,
+                        arguments: [
+                          { name: "input", type: "json!" }
+                        ],
+                        output_type: "json"
+                      },
+                      comment: "managed-by=graphql-async-bootstrap async-request-publisher"
+                    }
+                  }')"
+                metadata_post "${CREATE_ACTION_PAYLOAD}"
+              fi
+
+              if ! action_permission_exists "publish_async_request" "user"; then
+                CREATE_ACTION_PERMISSION_USER_PAYLOAD="$(jq -n '{
+                  type: "create_action_permission",
+                  args: {
+                    action: "publish_async_request",
+                    role: "user",
+                    comment: "managed-by=graphql-async-bootstrap async-request-publisher"
+                  }
+                }')"
+                metadata_post "${CREATE_ACTION_PERMISSION_USER_PAYLOAD}"
+              fi
+
+              if ! action_permission_exists "publish_async_request" "service"; then
+                CREATE_ACTION_PERMISSION_SERVICE_PAYLOAD="$(jq -n '{
+                  type: "create_action_permission",
+                  args: {
+                    action: "publish_async_request",
+                    role: "service",
+                    comment: "managed-by=graphql-async-bootstrap async-request-publisher"
+                  }
+                }')"
+                metadata_post "${CREATE_ACTION_PERMISSION_SERVICE_PAYLOAD}"
               fi
 
               echo "graphql.client_async_messages bootstrap complete"

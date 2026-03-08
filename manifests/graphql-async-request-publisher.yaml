@@ -1,0 +1,695 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: graphql-async-request-publisher
+  namespace: graphql
+data:
+  publisher.py: |
+    #!/usr/bin/env python3
+    import json
+    import os
+    import signal
+    import threading
+    import time
+    import traceback
+    import uuid
+    from datetime import datetime, timedelta, timezone
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    import psycopg
+    from kafka import KafkaProducer
+
+    KAFKA_BOOTSTRAP_SERVERS = [
+      item.strip()
+      for item in os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka.kafka.svc.internal.lan:9092").split(",")
+      if item.strip()
+    ]
+    KAFKA_REQUEST_TOPIC = os.environ.get("KAFKA_REQUEST_TOPIC", "graphql.async.requests.v1").strip()
+    KAFKA_RESPONSE_TOPIC = os.environ.get("KAFKA_RESPONSE_TOPIC", "graphql.async.responses.v1").strip()
+    KAFKA_USERNAME_PATH = os.environ.get("KAFKA_USERNAME_PATH", "/vault/secrets/kafka-async-username")
+    KAFKA_PASSWORD_PATH = os.environ.get("KAFKA_PASSWORD_PATH", "/vault/secrets/kafka-async-password")
+    DB_URL_PATH = os.environ.get("DB_URL_PATH", "/vault/secrets/db-url")
+
+    DEFAULT_EXPIRES_IN_SECONDS = int(os.environ.get("DEFAULT_EXPIRES_IN_SECONDS", "86400"))
+    MAX_EXPIRES_IN_SECONDS = int(os.environ.get("MAX_EXPIRES_IN_SECONDS", "1209600"))
+    MAX_MESSAGE_BYTES = int(os.environ.get("MAX_MESSAGE_BYTES", "1048576"))
+
+    RUNNING = True
+    PRODUCER = None
+    PRODUCER_LOCK = threading.Lock()
+
+    INSERT_PENDING_SQL = """
+    INSERT INTO graphql.client_async_messages (
+      request_id,
+      client_id,
+      status,
+      request_payload,
+      kafka_topic,
+      metadata,
+      expires_at
+    ) VALUES (
+      %s,
+      %s,
+      'pending',
+      %s::jsonb,
+      %s,
+      %s::jsonb,
+      %s::timestamptz
+    )
+    ON CONFLICT (request_id) DO NOTHING
+    RETURNING status, expires_at
+    """
+
+    SELECT_EXISTING_SQL = """
+    SELECT client_id, status, expires_at
+    FROM graphql.client_async_messages
+    WHERE request_id = %s
+    """
+
+    UPDATE_PUBLISH_SUCCESS_SQL = """
+    UPDATE graphql.client_async_messages
+    SET
+      kafka_partition = %s,
+      kafka_offset = %s,
+      metadata = COALESCE(metadata, '{}'::jsonb) || COALESCE(%s::jsonb, '{}'::jsonb),
+      updated_at = NOW()
+    WHERE request_id = %s
+    """
+
+    UPDATE_PUBLISH_ERROR_SQL = """
+    UPDATE graphql.client_async_messages
+    SET
+      status = 'error',
+      error_payload = COALESCE(%s::jsonb, error_payload),
+      metadata = COALESCE(metadata, '{}'::jsonb) || COALESCE(%s::jsonb, '{}'::jsonb),
+      completed_at = NOW(),
+      updated_at = NOW()
+    WHERE request_id = %s
+    """
+
+
+    class RequestError(Exception):
+      def __init__(self, status_code, message):
+        super().__init__(message)
+        self.status_code = int(status_code)
+        self.message = str(message)
+
+
+    def utc_now():
+      return datetime.now(timezone.utc)
+
+
+    def to_iso(value):
+      if value is None:
+        return None
+      return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+    def log(message):
+      print(f"[{to_iso(utc_now())}] {message}", flush=True)
+
+
+    def signal_handler(signum, _frame):
+      global RUNNING
+      RUNNING = False
+      log(f"Received signal {signum}, shutting down")
+
+
+    def wait_for_file(path):
+      while RUNNING:
+        if os.path.isfile(path) and os.path.getsize(path) > 0:
+          return
+        log(f"Waiting for secret file {path}")
+        time.sleep(2)
+      raise RuntimeError("Stopped while waiting for secret files")
+
+
+    def read_secret(path, label):
+      wait_for_file(path)
+      with open(path, "r", encoding="utf-8") as handle:
+        value = handle.read().strip()
+      if not value:
+        raise RuntimeError(f"{label} is empty at {path}")
+      return value
+
+
+    def parse_timestamp(value):
+      if value is None:
+        return None
+      if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+      if not isinstance(value, str):
+        return None
+      text = value.strip()
+      if not text:
+        return None
+      if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+      try:
+        parsed = datetime.fromisoformat(text)
+      except ValueError:
+        return None
+      if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+      return parsed.astimezone(timezone.utc)
+
+
+    def normalize_dict_keys(data):
+      normalized = {}
+      if not isinstance(data, dict):
+        return normalized
+      for key, value in data.items():
+        normalized[str(key).strip().lower()] = value
+      return normalized
+
+
+    def normalize_headers(raw_headers):
+      if isinstance(raw_headers, dict):
+        return normalize_dict_keys(raw_headers)
+      if isinstance(raw_headers, list):
+        headers = {}
+        for item in raw_headers:
+          if not isinstance(item, dict):
+            continue
+          name = item.get("name")
+          value = item.get("value")
+          if name and value is not None:
+            headers[str(name).strip().lower()] = str(value)
+        return headers
+      return {}
+
+
+    def extract_action_input(payload):
+      input_data = payload.get("input") or {}
+      if (
+        isinstance(input_data, dict)
+        and len(input_data) == 1
+        and isinstance(input_data.get("input"), dict)
+      ):
+        input_data = input_data["input"]
+      if not isinstance(input_data, dict):
+        raise RequestError(400, "input must be an object")
+      return input_data
+
+
+    def resolve_client_id(session_vars, input_data):
+      role = str(session_vars.get("x-hasura-role") or "").strip().lower()
+      session_user_id = str(session_vars.get("x-hasura-user-id") or "").strip()
+      input_client_id = input_data.get("client_id")
+      if input_client_id is not None:
+        input_client_id = str(input_client_id).strip() or None
+
+      if role == "service":
+        client_id = input_client_id or session_user_id
+        if not client_id:
+          raise RequestError(400, "client_id is required for service role")
+        return client_id
+
+      if not session_user_id:
+        raise RequestError(403, "missing X-Hasura-User-Id session variable")
+      if input_client_id and input_client_id != session_user_id:
+        raise RequestError(403, "client_id must match X-Hasura-User-Id")
+      return session_user_id
+
+
+    def resolve_request_id(input_data, request_headers):
+      candidate = input_data.get("request_id")
+      if candidate is not None:
+        request_id = str(candidate).strip()
+        if request_id:
+          return request_id
+      header_id = request_headers.get("x-request-id") or request_headers.get("cf-ray")
+      if header_id:
+        return str(header_id).strip()
+      return str(uuid.uuid4())
+
+
+    def resolve_expiration(input_data, submitted_at):
+      expires_at = parse_timestamp(input_data.get("expires_at"))
+      if expires_at is not None:
+        if expires_at <= submitted_at:
+          raise RequestError(400, "expires_at must be in the future")
+        return expires_at
+
+      expires_in = input_data.get("expires_in_seconds")
+      if expires_in is None:
+        expires_in = DEFAULT_EXPIRES_IN_SECONDS
+      try:
+        expires_in = int(expires_in)
+      except (TypeError, ValueError):
+        raise RequestError(400, "expires_in_seconds must be an integer")
+      if expires_in <= 0:
+        raise RequestError(400, "expires_in_seconds must be greater than 0")
+      if expires_in > MAX_EXPIRES_IN_SECONDS:
+        expires_in = MAX_EXPIRES_IN_SECONDS
+      return submitted_at + timedelta(seconds=expires_in)
+
+
+    def parse_optional_object(value, field_name):
+      if value is None:
+        return {}
+      if isinstance(value, dict):
+        return value
+      raise RequestError(400, f"{field_name} must be an object")
+
+
+    def ensure_required_text(value, field_name):
+      text = str(value or "").strip()
+      if not text:
+        raise RequestError(400, f"{field_name} is required")
+      return text
+
+
+    def parse_priority(input_data):
+      priority = str(input_data.get("priority") or "normal").strip().lower()
+      if not priority:
+        return "normal"
+      return priority
+
+
+    def get_kafka_producer():
+      global PRODUCER
+      with PRODUCER_LOCK:
+        if PRODUCER is not None:
+          return PRODUCER
+        username = read_secret(KAFKA_USERNAME_PATH, "Kafka username")
+        password = read_secret(KAFKA_PASSWORD_PATH, "Kafka password")
+        PRODUCER = KafkaProducer(
+          bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+          security_protocol="SASL_PLAINTEXT",
+          sasl_mechanism="SCRAM-SHA-256",
+          sasl_plain_username=username,
+          sasl_plain_password=password,
+          acks="all",
+          retries=5,
+          linger_ms=10,
+          request_timeout_ms=30000,
+        )
+        return PRODUCER
+
+
+    def reset_kafka_producer():
+      global PRODUCER
+      with PRODUCER_LOCK:
+        old = PRODUCER
+        PRODUCER = None
+      if old is not None:
+        try:
+          old.close(timeout=5)
+        except Exception:
+          pass
+
+
+    def build_message_spec(action_name, input_data, session_vars, request_headers):
+      submitted_at = utc_now()
+      client_id = resolve_client_id(session_vars, input_data)
+      request_id = resolve_request_id(input_data, request_headers)
+      expires_at = resolve_expiration(input_data, submitted_at)
+      handler_name = ensure_required_text(input_data.get("handler"), "handler")
+      operation_name = ensure_required_text(input_data.get("operation"), "operation")
+      payload = input_data.get("payload")
+      metadata = parse_optional_object(input_data.get("metadata"), "metadata")
+      priority = parse_priority(input_data)
+      reply_topic = str(input_data.get("reply_topic") or KAFKA_RESPONSE_TOPIC).strip()
+      if not reply_topic:
+        reply_topic = KAFKA_RESPONSE_TOPIC
+
+      trace = {}
+      traceparent = request_headers.get("traceparent")
+      if traceparent:
+        trace["traceparent"] = traceparent
+      tracestate = request_headers.get("tracestate")
+      if tracestate:
+        trace["tracestate"] = tracestate
+      if request_headers.get("x-request-id"):
+        trace["request_id"] = str(request_headers["x-request-id"])
+
+      message = {
+        "spec_version": "async.request.v1",
+        "request_id": request_id,
+        "client_id": client_id,
+        "route": {
+          "handler": handler_name,
+          "operation": operation_name,
+        },
+        "payload": payload,
+        "options": {
+          "priority": priority,
+          "reply_topic": reply_topic,
+          "expires_at": to_iso(expires_at),
+        },
+        "metadata": metadata,
+        "submitted_at": to_iso(submitted_at),
+      }
+      if trace:
+        message["trace"] = trace
+      if action_name:
+        message["action"] = action_name
+      return message, submitted_at, expires_at
+
+
+    def get_db_url():
+      return read_secret(DB_URL_PATH, "database URL")
+
+
+    def write_pending_record(db_url, request_id, client_id, message, expires_at):
+      request_payload = json.dumps(message, separators=(",", ":"), ensure_ascii=False)
+      metadata = json.dumps(
+        {
+          "request_topic": KAFKA_REQUEST_TOPIC,
+          "request_publisher": "graphql-async-request-publisher",
+          "request_published": False,
+        },
+        separators=(",", ":"),
+        ensure_ascii=False,
+      )
+      with psycopg.connect(db_url, connect_timeout=10) as conn:
+        conn.autocommit = False
+        with conn.cursor() as cur:
+          cur.execute(
+            INSERT_PENDING_SQL,
+            (
+              request_id,
+              client_id,
+              request_payload,
+              KAFKA_REQUEST_TOPIC,
+              metadata,
+              expires_at,
+            ),
+          )
+          row = cur.fetchone()
+          if row:
+            conn.commit()
+            return {"inserted": True}
+
+          cur.execute(SELECT_EXISTING_SQL, (request_id,))
+          existing = cur.fetchone()
+          conn.commit()
+      if not existing:
+        raise RuntimeError("request row lookup failed after conflict")
+      return {
+        "inserted": False,
+        "client_id": str(existing[0]),
+        "status": str(existing[1]),
+        "expires_at": existing[2],
+      }
+
+
+    def mark_publish_success(db_url, request_id, partition, offset):
+      metadata = json.dumps(
+        {
+          "request_topic": KAFKA_REQUEST_TOPIC,
+          "request_publisher": "graphql-async-request-publisher",
+          "request_published": True,
+          "request_published_at": to_iso(utc_now()),
+        },
+        separators=(",", ":"),
+        ensure_ascii=False,
+      )
+      with psycopg.connect(db_url, connect_timeout=10) as conn:
+        conn.autocommit = False
+        with conn.cursor() as cur:
+          cur.execute(
+            UPDATE_PUBLISH_SUCCESS_SQL,
+            (partition, offset, metadata, request_id),
+          )
+        conn.commit()
+
+
+    def mark_publish_error(db_url, request_id, error_message):
+      error_payload = json.dumps(
+        {"code": "request_publish_failed", "message": str(error_message)},
+        separators=(",", ":"),
+        ensure_ascii=False,
+      )
+      metadata = json.dumps(
+        {
+          "request_topic": KAFKA_REQUEST_TOPIC,
+          "request_publisher": "graphql-async-request-publisher",
+          "request_published": False,
+          "request_publish_error_at": to_iso(utc_now()),
+        },
+        separators=(",", ":"),
+        ensure_ascii=False,
+      )
+      with psycopg.connect(db_url, connect_timeout=10) as conn:
+        conn.autocommit = False
+        with conn.cursor() as cur:
+          cur.execute(UPDATE_PUBLISH_ERROR_SQL, (error_payload, metadata, request_id))
+        conn.commit()
+
+
+    def publish_to_kafka(message):
+      producer = get_kafka_producer()
+      message_bytes = json.dumps(message, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+      if len(message_bytes) > MAX_MESSAGE_BYTES:
+        raise RequestError(400, f"message exceeds MAX_MESSAGE_BYTES={MAX_MESSAGE_BYTES}")
+      key_bytes = str(message["request_id"]).encode("utf-8")
+      record = producer.send(KAFKA_REQUEST_TOPIC, key=key_bytes, value=message_bytes).get(timeout=20)
+      producer.flush(timeout=10)
+      return int(record.partition), int(record.offset)
+
+
+    class Handler(BaseHTTPRequestHandler):
+      def log_message(self, _format, *_args):
+        return
+
+      def send_json(self, status_code, payload):
+        body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+      def do_GET(self):
+        if self.path == "/healthz":
+          self.send_json(200, {"ok": True})
+          return
+        self.send_json(404, {"error": "not_found"})
+
+      def do_POST(self):
+        if not self.path.startswith("/action/publish_async_request"):
+          self.send_json(404, {"error": "not_found"})
+          return
+
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length) if content_length else b""
+        request_id = None
+        try:
+          payload = json.loads(raw_body.decode("utf-8") or "{}")
+          if not isinstance(payload, dict):
+            raise RequestError(400, "payload must be a JSON object")
+
+          input_data = extract_action_input(payload)
+          session_vars = normalize_dict_keys(payload.get("session_variables") or {})
+          request_headers = normalize_headers(payload.get("request_headers"))
+          if isinstance(payload.get("request"), dict):
+            request_headers.update(normalize_headers(payload.get("request", {}).get("headers")))
+          if not request_headers:
+            request_headers = normalize_headers(payload.get("headers"))
+          if not request_headers:
+            request_headers = normalize_headers(dict(self.headers))
+          action_name = ""
+          if isinstance(payload.get("action"), dict):
+            action_name = str(payload.get("action", {}).get("name") or "").strip()
+
+          message, submitted_at, expires_at = build_message_spec(
+            action_name=action_name,
+            input_data=input_data,
+            session_vars=session_vars,
+            request_headers=request_headers,
+          )
+          request_id = str(message["request_id"])
+          db_url = get_db_url()
+
+          upsert_result = write_pending_record(
+            db_url=db_url,
+            request_id=request_id,
+            client_id=str(message["client_id"]),
+            message=message,
+            expires_at=expires_at,
+          )
+          if not upsert_result["inserted"]:
+            if upsert_result["client_id"] != str(message["client_id"]):
+              raise RequestError(409, "request_id already exists for a different client_id")
+            self.send_json(
+              200,
+              {
+                "request_id": request_id,
+                "status": "duplicate",
+                "kafka_topic": KAFKA_REQUEST_TOPIC,
+                "client_id": str(message["client_id"]),
+                "submitted_at": to_iso(submitted_at),
+                "expires_at": to_iso(upsert_result.get("expires_at")),
+              },
+            )
+            return
+
+          try:
+            partition, offset = publish_to_kafka(message)
+            mark_publish_success(db_url, request_id, partition, offset)
+          except Exception as exc:
+            reset_kafka_producer()
+            try:
+              mark_publish_error(db_url, request_id, exc)
+            except Exception as mark_exc:
+              log(f"Failed to record publish error for request_id={request_id}: {mark_exc}")
+            raise
+
+          self.send_json(
+            200,
+            {
+              "request_id": request_id,
+              "status": "accepted",
+              "kafka_topic": KAFKA_REQUEST_TOPIC,
+              "kafka_partition": partition,
+              "kafka_offset": offset,
+              "client_id": str(message["client_id"]),
+              "submitted_at": to_iso(submitted_at),
+              "expires_at": to_iso(expires_at),
+            },
+          )
+        except RequestError as exc:
+          self.send_json(exc.status_code, {"message": exc.message, "request_id": request_id})
+        except Exception as exc:
+          log(f"Action publish_async_request failed: {exc}")
+          traceback.print_exc()
+          self.send_json(500, {"message": "internal error", "request_id": request_id})
+
+
+    def main():
+      signal.signal(signal.SIGTERM, signal_handler)
+      signal.signal(signal.SIGINT, signal_handler)
+      wait_for_file(KAFKA_USERNAME_PATH)
+      wait_for_file(KAFKA_PASSWORD_PATH)
+      wait_for_file(DB_URL_PATH)
+      log(
+        "Async request publisher started "
+        f"bootstrap={','.join(KAFKA_BOOTSTRAP_SERVERS)} "
+        f"request_topic={KAFKA_REQUEST_TOPIC}"
+      )
+      server = ThreadingHTTPServer(("0.0.0.0", 8080), Handler)
+      server.serve_forever()
+
+
+    if __name__ == "__main__":
+      main()
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: graphql-async-request-publisher
+  namespace: graphql
+spec:
+  selector:
+    app: graphql-async-request-publisher
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: graphql-async-request-publisher
+  namespace: graphql
+  annotations:
+    argocd.argoproj.io/sync-wave: "4"
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: graphql-async-request-publisher
+  template:
+    metadata:
+      labels:
+        app: graphql-async-request-publisher
+      annotations:
+        linkerd.io/inject: "disabled"
+        reloader.stakater.com/auto: "true"
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "graphql-async-response-writer"
+        vault.hashicorp.com/agent-inject-secret-kafka-async-username: "secret/data/graphql-kafka-async-username"
+        vault.hashicorp.com/agent-inject-template-kafka-async-username: |
+          {{- with secret "secret/data/graphql-kafka-async-username" -}}
+          {{ .Data.data.value }}
+          {{- end }}
+        vault.hashicorp.com/agent-inject-secret-kafka-async-password: "secret/data/graphql-kafka-async-password"
+        vault.hashicorp.com/agent-inject-template-kafka-async-password: |
+          {{- with secret "secret/data/graphql-kafka-async-password" -}}
+          {{ .Data.data.value }}
+          {{- end }}
+        vault.hashicorp.com/agent-inject-secret-db-url: "yugabyte-db/static-creds/graphql-yb-admin"
+        vault.hashicorp.com/agent-inject-template-db-url: |
+          {{- with secret "yugabyte-db/static-creds/graphql-yb-admin" -}}
+          postgresql://{{ .Data.username }}:{{ .Data.password }}@yb-tserver-service.yugabyte.svc.cluster.local:5433/hasura?sslmode=disable
+          {{- end }}
+    spec:
+      serviceAccountName: graphql-async-response-writer
+      containers:
+        - name: request-publisher
+          image: python:3.12-slim
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: "kafka.kafka.svc.internal.lan:9092"
+            - name: KAFKA_REQUEST_TOPIC
+              value: "graphql.async.requests.v1"
+            - name: KAFKA_RESPONSE_TOPIC
+              value: "graphql.async.responses.v1"
+            - name: KAFKA_USERNAME_PATH
+              value: "/vault/secrets/kafka-async-username"
+            - name: KAFKA_PASSWORD_PATH
+              value: "/vault/secrets/kafka-async-password"
+            - name: DB_URL_PATH
+              value: "/vault/secrets/db-url"
+            - name: DEFAULT_EXPIRES_IN_SECONDS
+              value: "86400"
+            - name: MAX_EXPIRES_IN_SECONDS
+              value: "1209600"
+            - name: MAX_MESSAGE_BYTES
+              value: "1048576"
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              set -euo pipefail
+              pip install --no-cache-dir --disable-pip-version-check \
+                "kafka-python>=2.0.2,<3.0.0" \
+                "psycopg[binary]>=3.1.0,<4.0.0"
+              exec python /opt/config/publisher.py
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 3
+          volumeMounts:
+            - name: publisher-config
+              mountPath: /opt/config
+              readOnly: true
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+      volumes:
+        - name: publisher-config
+          configMap:
+            name: graphql-async-request-publisher
+            defaultMode: 0555

@@ -46,6 +46,11 @@ This repo includes idempotent bootstrap jobs for the async GraphQL + Kafka flow:
   - Authenticates to Kafka using the same Vault-managed async principal.
   - Writes service responses idempotently into `graphql.client_async_messages` by `request_id`.
   - Sends permanently invalid response messages (for example invalid JSON/missing `request_id`) to `graphql.async.responses.dlq.v1`.
+- `manifests/graphql-async-request-publisher.yaml`
+  - Runs a Hasura Action handler (`Deployment` + `Service`) for generic async request publishing.
+  - Handles action `publish_async_request`.
+  - Inserts/updates a `pending` record in `graphql.client_async_messages`.
+  - Publishes a generic request envelope to topic `graphql.async.requests.v1`.
 - `manifests/graphql-async-cleanup.yaml`
   - Runs a scheduled cleanup (`CronJob`) every 10 minutes.
   - Deletes expired rows from `graphql.client_async_messages` where `expires_at < NOW()`.
@@ -58,11 +63,63 @@ Vault role/policy for the Kafka setup job are created by:
 ```sh
 kubectl -n graphql get job graphql-async-bootstrap graphql-kafka-setup
 kubectl -n graphql get deploy graphql-async-response-writer
+kubectl -n graphql get deploy graphql-async-request-publisher
 kubectl -n graphql get cronjob graphql-async-cleanup
 kubectl -n graphql logs job/graphql-async-bootstrap --tail=200
 kubectl -n graphql logs job/graphql-kafka-setup --tail=200
 kubectl -n graphql logs deploy/graphql-async-response-writer --tail=200
+kubectl -n graphql logs deploy/graphql-async-request-publisher --tail=200
 kubectl -n graphql get job --sort-by=.metadata.creationTimestamp | tail -n 5
+```
+
+### Generic async action
+Bootstrap creates Hasura action `publish_async_request` with handler:
+
+- `http://graphql-async-request-publisher.graphql.svc.cluster.local:8080/action/publish_async_request`
+
+Action argument:
+- `input: json!`
+
+Recommended action input shape:
+
+```json
+{
+  "request_id": "optional-idempotency-key",
+  "client_id": "optional-for-service-role",
+  "handler": "billing-worker",
+  "operation": "invoice.create",
+  "payload": { "invoice_id": "inv_123", "amount": 42.5 },
+  "metadata": { "tenant": "acme" },
+  "priority": "normal",
+  "expires_in_seconds": 3600
+}
+```
+
+Published Kafka request envelope (`graphql.async.requests.v1`):
+
+```json
+{
+  "spec_version": "async.request.v1",
+  "request_id": "req-123",
+  "client_id": "user-123",
+  "route": { "handler": "billing-worker", "operation": "invoice.create" },
+  "payload": { "invoice_id": "inv_123", "amount": 42.5 },
+  "options": {
+    "priority": "normal",
+    "reply_topic": "graphql.async.responses.v1",
+    "expires_at": "2026-03-07T23:50:00Z"
+  },
+  "metadata": { "tenant": "acme" },
+  "submitted_at": "2026-03-07T22:50:00Z"
+}
+```
+
+GraphQL mutation example:
+
+```graphql
+mutation PublishAsync($input: json!) {
+  publish_async_request(input: $input)
+}
 ```
 
 Verify Hasura now exposes subscriptions (subscription root becomes non-null once a table is tracked):

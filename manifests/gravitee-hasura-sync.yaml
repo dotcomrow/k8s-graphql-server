@@ -470,11 +470,25 @@ data:
         remote_schemas = sorted(remote_schemas, key=lambda item: str(item.get("name", "")))
         existing_actions = metadata.get("actions") or []
         kept_actions = [action for action in existing_actions if MANAGED_COMMENT not in str(action.get("comment", ""))]
-        metadata["actions"] = kept_actions + actions
+        merged_actions = sorted(
+            kept_actions + actions,
+            key=lambda item: str(item.get("name", "")),
+        )
+        if merged_actions:
+            metadata["actions"] = merged_actions
+        else:
+            metadata.pop("actions", None)
 
         existing_remotes = metadata.get("remote_schemas") or []
         kept_remotes = [remote for remote in existing_remotes if MANAGED_COMMENT not in str(remote.get("comment", ""))]
-        metadata["remote_schemas"] = kept_remotes + remote_schemas
+        merged_remotes = sorted(
+            kept_remotes + remote_schemas,
+            key=lambda item: str(item.get("name", "")),
+        )
+        if merged_remotes:
+            metadata["remote_schemas"] = merged_remotes
+        else:
+            metadata.pop("remote_schemas", None)
 
         custom_types = metadata.get("custom_types") or {}
         scalars = custom_types.get("scalars") or []

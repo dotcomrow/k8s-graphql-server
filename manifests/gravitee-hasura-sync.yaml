@@ -465,6 +465,8 @@ data:
 
     def merge_metadata(metadata, actions, remote_schemas):
         metadata = dict(metadata or {})
+        actions = sorted(actions, key=lambda item: str(item.get("name", "")))
+        remote_schemas = sorted(remote_schemas, key=lambda item: str(item.get("name", "")))
         existing_actions = metadata.get("actions") or []
         kept_actions = [action for action in existing_actions if MANAGED_COMMENT not in str(action.get("comment", ""))]
         metadata["actions"] = kept_actions + actions
@@ -480,6 +482,9 @@ data:
         custom_types["scalars"] = scalars
         metadata["custom_types"] = custom_types
         return metadata
+
+    def canonical_json(value):
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
     def sync_once():
         if not SYNC_LOCK.acquire(blocking=False):
@@ -523,12 +528,17 @@ data:
 
             current = hasura_request({"type": "export_metadata", "args": {}})
             merged = merge_metadata(current, actions, remotes)
-            hasura_request({"type": "replace_metadata", "args": merged})
+            metadata_changed = canonical_json(merged) != canonical_json(current)
+            if metadata_changed:
+                hasura_request({"type": "replace_metadata", "args": merged})
 
             with ACTION_LOCK:
                 ACTION_MAP.clear()
                 ACTION_MAP.update(action_mapping)
-            log(f"Sync complete: actions={len(actions)} remote_schemas={len(remotes)}")
+            if metadata_changed:
+                log(f"Sync complete: actions={len(actions)} remote_schemas={len(remotes)}")
+            else:
+                log(f"Sync complete: actions={len(actions)} remote_schemas={len(remotes)} (no metadata changes)")
         except Exception as exc:
             log(f"sync error: {exc}")
         finally:

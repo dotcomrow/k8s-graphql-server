@@ -56,6 +56,7 @@ data:
         "http://graphql-gravitee-sync.graphql.svc.cluster.local:8080/action",
     )
     SYNC_INTERVAL = int(os.environ.get("SYNC_INTERVAL", "300"))
+    JWT_CLOCK_SKEW_SECONDS = int(os.environ.get("JWT_CLOCK_SKEW_SECONDS", "60"))
     ACTION_TIMEOUT_SECONDS = int(os.environ.get("ACTION_TIMEOUT_SECONDS", "30"))
     REMOTE_SCHEMA_TIMEOUT_SECONDS = int(os.environ.get("REMOTE_SCHEMA_TIMEOUT_SECONDS", "60"))
     INSECURE_SKIP_VERIFY = os.environ.get("INSECURE_SKIP_VERIFY", "false").lower() in ("1", "true", "yes")
@@ -611,6 +612,7 @@ data:
             {"jwk_url": INTERNAL_JWK_URL, "issuer": INTERNAL_ISSUER, "audience": INTERNAL_AUDIENCE},
             {"jwk_url": EXTERNAL_JWK_URL, "issuer": EXTERNAL_ISSUER, "audience": external_aud},
         ]
+        last_error = None
         for cfg in configs:
             if not cfg["audience"]:
                 continue
@@ -622,9 +624,13 @@ data:
                     algorithms=["RS256"],
                     audience=cfg["audience"],
                     issuer=cfg["issuer"],
+                    leeway=JWT_CLOCK_SKEW_SECONDS,
                 )
-            except Exception:
+            except Exception as exc:
+                last_error = exc
                 continue
+        if last_error is not None:
+            log("auth_decode failed reason=" + type(last_error).__name__)
         return None
 
     def extract_hasura_claims(claims):
@@ -745,6 +751,12 @@ data:
                 return
             if self.path.startswith("/auth"):
                 auth_header = self.headers.get("Authorization")
+                xfwd_token = self.headers.get("X-Forwarded-Access-Token")
+                if xfwd_token:
+                    token = xfwd_token.strip()
+                    if token and not token.lower().startswith("bearer "):
+                        token = f"Bearer {token}"
+                    auth_header = token
                 cf_connecting_ip = self.headers.get("CF-Connecting-IP") or self.headers.get("Cf-Connecting-Ip")
                 xff = self.headers.get("X-Forwarded-For") or self.headers.get("x-forwarded-for")
                 client_ip = cf_connecting_ip or (xff.split(",", 1)[0].strip() if xff else "")
@@ -1217,6 +1229,8 @@ spec:
               value: "http://graphql-gravitee-sync.graphql.svc.cluster.local:8080/action"
             - name: SYNC_INTERVAL
               value: "300"
+            - name: JWT_CLOCK_SKEW_SECONDS
+              value: "60"
             - name: ACTION_TIMEOUT_SECONDS
               value: "30"
             - name: REMOTE_SCHEMA_TIMEOUT_SECONDS

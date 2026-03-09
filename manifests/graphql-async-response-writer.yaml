@@ -505,7 +505,7 @@ spec:
             - name: KAFKA_CONSUMER_GROUP
               value: "graphql-async-response-writer"
             - name: KAFKA_AUTO_OFFSET_RESET
-              value: "earliest"
+              value: "latest"
             - name: KAFKA_USERNAME_PATH
               value: "/vault/secrets/kafka-async-username"
             - name: KAFKA_PASSWORD_PATH

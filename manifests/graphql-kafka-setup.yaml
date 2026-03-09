@@ -64,11 +64,17 @@ spec:
             - name: KAFKA_REPLICATION_FACTOR
               value: "1"
             - name: KAFKA_REQUEST_RETENTION_MS
-              value: "604800000"
+              value: "3600000"
             - name: KAFKA_RESPONSE_RETENTION_MS
-              value: "604800000"
+              value: "3600000"
             - name: KAFKA_DLQ_RETENTION_MS
-              value: "1209600000"
+              value: "86400000"
+            - name: KAFKA_REQUEST_SEGMENT_MS
+              value: "300000"
+            - name: KAFKA_RESPONSE_SEGMENT_MS
+              value: "300000"
+            - name: KAFKA_DLQ_SEGMENT_MS
+              value: "900000"
             - name: KAFKA_SCRAM_ITERATIONS
               value: "4096"
             - name: KAFKA_CONSUMER_GROUP
@@ -184,6 +190,7 @@ spec:
                 local topic="$1"
                 local partitions="$2"
                 local retention_ms="$3"
+                local segment_ms="$4"
 
                 if kafka_cli kafka-topics.sh --describe --topic "${topic}" >/dev/null 2>&1; then
                   echo "Topic exists: ${topic}"
@@ -201,14 +208,14 @@ spec:
                   --alter \
                   --entity-type topics \
                   --entity-name "${topic}" \
-                  --add-config "retention.ms=${retention_ms},cleanup.policy=delete,min.insync.replicas=1"
+                  --add-config "retention.ms=${retention_ms},segment.ms=${segment_ms},cleanup.policy=delete,min.insync.replicas=1"
 
                 kafka_cli kafka-topics.sh --describe --topic "${topic}"
               }
 
-              create_or_update_topic "${KAFKA_REQUEST_TOPIC}" "${KAFKA_REQUEST_PARTITIONS}" "${KAFKA_REQUEST_RETENTION_MS}"
-              create_or_update_topic "${KAFKA_RESPONSE_TOPIC}" "${KAFKA_RESPONSE_PARTITIONS}" "${KAFKA_RESPONSE_RETENTION_MS}"
-              create_or_update_topic "${KAFKA_DLQ_TOPIC}" "${KAFKA_DLQ_PARTITIONS}" "${KAFKA_DLQ_RETENTION_MS}"
+              create_or_update_topic "${KAFKA_REQUEST_TOPIC}" "${KAFKA_REQUEST_PARTITIONS}" "${KAFKA_REQUEST_RETENTION_MS}" "${KAFKA_REQUEST_SEGMENT_MS}"
+              create_or_update_topic "${KAFKA_RESPONSE_TOPIC}" "${KAFKA_RESPONSE_PARTITIONS}" "${KAFKA_RESPONSE_RETENTION_MS}" "${KAFKA_RESPONSE_SEGMENT_MS}"
+              create_or_update_topic "${KAFKA_DLQ_TOPIC}" "${KAFKA_DLQ_PARTITIONS}" "${KAFKA_DLQ_RETENTION_MS}" "${KAFKA_DLQ_SEGMENT_MS}"
 
               echo "Ensuring SCRAM credentials for user ${KAFKA_ASYNC_USERNAME}"
               SCRAM_OUTPUT=""

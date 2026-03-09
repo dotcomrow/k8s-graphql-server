@@ -30,7 +30,7 @@ data:
     ]
     KAFKA_RESPONSE_TOPIC = os.environ.get("KAFKA_RESPONSE_TOPIC", "graphql.async.responses.v1")
     KAFKA_DLQ_TOPIC = os.environ.get("KAFKA_DLQ_TOPIC", "graphql.async.responses.dlq.v1").strip()
-    KAFKA_CONSUMER_GROUP = os.environ.get("KAFKA_CONSUMER_GROUP", "graphql-async-workers")
+    KAFKA_CONSUMER_GROUP = os.environ.get("KAFKA_CONSUMER_GROUP", "graphql-async-response-writer")
     KAFKA_AUTO_OFFSET_RESET = os.environ.get("KAFKA_AUTO_OFFSET_RESET", "earliest")
 
     KAFKA_USERNAME_PATH = os.environ.get("KAFKA_USERNAME_PATH", "/vault/secrets/kafka-async-username")
@@ -332,7 +332,11 @@ data:
 
     def commit_message(consumer, message):
       topic_partition = TopicPartition(message.topic, message.partition)
-      consumer.commit({topic_partition: OffsetAndMetadata(message.offset + 1, "")})
+      try:
+        offset_meta = OffsetAndMetadata(message.offset + 1, "", None)
+      except TypeError:
+        offset_meta = OffsetAndMetadata(message.offset + 1, "")
+      consumer.commit({topic_partition: offset_meta})
 
 
     def send_to_dlq(producer, message, reason, detail):
@@ -499,7 +503,7 @@ spec:
             - name: KAFKA_DLQ_TOPIC
               value: "graphql.async.responses.dlq.v1"
             - name: KAFKA_CONSUMER_GROUP
-              value: "graphql-async-workers"
+              value: "graphql-async-response-writer"
             - name: KAFKA_AUTO_OFFSET_RESET
               value: "earliest"
             - name: KAFKA_USERNAME_PATH

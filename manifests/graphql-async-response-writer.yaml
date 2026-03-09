@@ -333,7 +333,7 @@ data:
     def commit_message(consumer, message):
       topic_partition = TopicPartition(message.topic, message.partition)
       try:
-        offset_meta = OffsetAndMetadata(message.offset + 1, "", None)
+        offset_meta = OffsetAndMetadata(message.offset + 1, "", -1)
       except TypeError:
         offset_meta = OffsetAndMetadata(message.offset + 1, "")
       consumer.commit({topic_partition: offset_meta})

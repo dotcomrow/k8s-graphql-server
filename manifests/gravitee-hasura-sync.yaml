@@ -432,8 +432,8 @@ data:
                     "name": action_name,
                     "definition": {
                         "kind": "synchronous",
+                        "type": "mutation",
                         "handler": ACTION_HANDLER_URL,
-                        "timeout": ACTION_TIMEOUT_SECONDS,
                         "forward_client_headers": True,
                         "arguments": [{"name": "input", "type": "json"}],
                         "output_type": "json",

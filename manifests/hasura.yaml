@@ -25,7 +25,11 @@ spec:
         vault.hashicorp.com/agent-inject-secret-hasura-admin: "secret/data/graphql/hasura-admin"
         vault.hashicorp.com/agent-inject-template-hasura-admin: |
           {{- with secret "secret/data/graphql/hasura-admin" -}}
+          {{- if .Data.data.admin_secret -}}
           {{ .Data.data.admin_secret }}
+          {{- else -}}
+          {{ .Data.data.value }}
+          {{- end -}}
           {{- end }}
         vault.hashicorp.com/agent-inject-secret-db-url: "yugabyte-db/static-creds/graphql-yb-admin"
         vault.hashicorp.com/agent-inject-template-db-url: |

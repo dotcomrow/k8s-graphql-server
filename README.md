@@ -154,11 +154,11 @@ cloudflared tunnel route dns graphql cf-suncoast-graphql-proxy.dev.suncoast.syst
 cloudflared tunnel token graphql
 ```
 
-2. Write the token into Vault (KVv2) at `secret/data/cloudflare-tunnel-token` with key `vaule`.
+2. Write the token into Vault (KVv2) at `secret/data/hasura-cloudflare-tunnel-token` with key `value`.
    Example:
 
 ```sh
-vault kv put secret/cloudflare-tunnel-token vaule='<PASTE_TUNNEL_TOKEN>'
+vault kv put secret/hasura-cloudflare-tunnel-token value='<PASTE_TUNNEL_TOKEN>'
 ```
 
 3. Deploy these manifests via ArgoCD sync (do not apply manually):
@@ -198,14 +198,14 @@ kubectl -n graphql describe externalsecret cloudflare-tunnel-token
 ```
 
 A Vault `403 permission denied` means Vault role/policy was not yet applied or is out of date. Ensure Argo has synced `manifests/00-vault-yugabyte-init.yaml` and the role `externalsecrets-graphql` has read/list on:
-- `secret/data/cloudflare-tunnel-token`
-- `secret/metadata/cloudflare-tunnel-token`
+- `secret/data/hasura-cloudflare-tunnel-token`
+- `secret/metadata/hasura-cloudflare-tunnel-token`
 
 ### Rotate token
 Update Vault and let External Secrets refresh:
 
 ```sh
-vault kv put secret/cloudflare-tunnel-token vaule='<NEW_TUNNEL_TOKEN>'
+vault kv put secret/hasura-cloudflare-tunnel-token value='<NEW_TUNNEL_TOKEN>'
 ```
 
 Optional immediate rollout after token update:

@@ -3,12 +3,16 @@ kind: ServiceAccount
 metadata:
   name: hasura
   namespace: graphql
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: hasura
   namespace: graphql
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
 spec:
   replicas: 2
   selector:

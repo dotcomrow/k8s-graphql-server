@@ -1,0 +1,77 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hasura-catalog-preflight
+  namespace: graphql
+  annotations:
+    argocd.argoproj.io/sync-options: Replace=true,Force=true
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        app: hasura-catalog-preflight
+      annotations:
+        linkerd.io/inject: "disabled"
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/agent-pre-populate-only: "true"
+        vault.hashicorp.com/role: "graphql"
+        vault.hashicorp.com/agent-inject-secret-db-url: "yugabyte-db/static-creds/graphql-yb-admin"
+        vault.hashicorp.com/agent-inject-template-db-url: |
+          {{- with secret "yugabyte-db/static-creds/graphql-yb-admin" -}}
+          postgresql://{{ .Data.username }}:{{ .Data.password }}@yb-tserver-service.yugabyte.svc.cluster.local:5433/hasura?sslmode=disable
+          {{- end }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: hasura
+      containers:
+        - name: preflight
+          image: postgres:15-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+
+              wait_for_file() {
+                path="$1"
+                while [ ! -s "$path" ]; do
+                  echo "Waiting for $path..."
+                  sleep 2
+                done
+              }
+
+              wait_for_file /vault/secrets/db-url
+              DB_URL="$(cat /vault/secrets/db-url)"
+
+              has_hdb_version="$(psql "$DB_URL" -Atc \
+                "SELECT EXISTS (
+                  SELECT 1
+                  FROM information_schema.tables
+                  WHERE table_schema = 'hdb_catalog' AND table_name = 'hdb_version'
+                );")"
+              has_hdb_metadata="$(psql "$DB_URL" -Atc \
+                "SELECT EXISTS (
+                  SELECT 1
+                  FROM information_schema.tables
+                  WHERE table_schema = 'hdb_catalog' AND table_name = 'hdb_metadata'
+                );")"
+
+              version_rows="0"
+              if [ "$has_hdb_version" = "t" ]; then
+                version_rows="$(psql "$DB_URL" -Atc "SELECT count(*) FROM hdb_catalog.hdb_version;")"
+              fi
+
+              echo "has_hdb_version=$has_hdb_version has_hdb_metadata=$has_hdb_metadata version_rows=$version_rows"
+
+              # Repair a known broken state where the catalog is partially created
+              # (only hdb_version exists and it has zero rows), which causes Hasura
+              # startup to fail with "Rows returned != 1".
+              if [ "$has_hdb_version" = "t" ] && [ "$has_hdb_metadata" != "t" ] && [ "$version_rows" = "0" ]; then
+                echo "Detected broken Hasura catalog bootstrap state; dropping hdb_catalog schema"
+                psql "$DB_URL" -v ON_ERROR_STOP=1 -c "DROP SCHEMA IF EXISTS hdb_catalog CASCADE;"
+              else
+                echo "Catalog preflight passed; no repair needed"
+              fi

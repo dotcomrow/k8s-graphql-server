@@ -11,6 +11,9 @@ The Hasura Deployment (`manifests/hasura.yaml`) mounts this ConfigMap at `/etc/h
 
 Env vars set directly on the container in `manifests/hasura.yaml` take precedence over values in `/etc/hasura/hasura.env` (the file provides defaults).
 
+`manifests/hasura-catalog-preflight.yaml` runs before the Hasura Deployment (Argo sync-wave ordering) and repairs a known partial-catalog state that causes Hasura startup to fail with:
+`Rows returned != 1` from `hdb_catalog.hdb_version`.
+
 ### Regenerating The Config Template
 The template is generated from the exact `hasura/graphql-engine` image pinned in `manifests/hasura.yaml`:
 

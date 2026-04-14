@@ -85,6 +85,10 @@ spec:
             - --config=/vault/secrets/oauth2.cfg
             - --provider=keycloak-oidc
             - --oidc-issuer-url=https://auth.suncoast.systems/realms/internal
+            - --skip-oidc-discovery=true
+            - --login-url=https://auth.suncoast.systems/realms/internal/protocol/openid-connect/auth
+            - --redeem-url=https://auth.suncoast.systems/realms/internal/protocol/openid-connect/token
+            - --oidc-jwks-url=https://auth.suncoast.systems/realms/internal/protocol/openid-connect/certs
             - --redirect-url=https://graphql-gui.teleport.app.suncoast.systems/oauth2/callback
             - --whitelist-domain=graphql-gui.teleport.app.suncoast.systems
             - --whitelist-domain=teleport.app.suncoast.systems

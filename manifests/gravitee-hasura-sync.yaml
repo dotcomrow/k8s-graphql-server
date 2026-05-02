@@ -650,14 +650,29 @@ data:
     def extract_hasura_claims(claims):
         if not isinstance(claims, dict):
             return {}
+        out = {}
         if CLAIMS_NAMESPACE in claims and isinstance(claims[CLAIMS_NAMESPACE], dict):
-            return claims[CLAIMS_NAMESPACE]
+            out.update(claims[CLAIMS_NAMESPACE])
         parent = claims.get(CLAIMS_PARENT)
         if isinstance(parent, dict):
             nested = parent.get(CLAIMS_CHILD)
             if isinstance(nested, dict):
-                return nested
-        return {}
+                out.update(nested)
+        # Keycloak mappers often emit flattened keys like:
+        #   "https://hasura.io/jwt/claims.x-hasura-default-role": "user"
+        # Accept those in addition to the nested-object form.
+        prefix = CLAIMS_NAMESPACE + "."
+        for key, value in claims.items():
+            if not isinstance(key, str):
+                continue
+            if not key.startswith(prefix):
+                continue
+            claim_key = key[len(prefix):].strip()
+            if not claim_key:
+                continue
+            if claim_key not in out:
+                out[claim_key] = value
+        return out
 
     def normalize_claim_value(value):
         if isinstance(value, (list, dict)):
@@ -845,6 +860,9 @@ data:
                 )
                 session_vars = build_session_vars(hasura_claims, traceparent, tracestate, baggage)
                 if "X-Hasura-Role" not in session_vars:
+                    hasura_keys = ",".join(
+                        sorted([key for key in hasura_claims.keys() if isinstance(key, str)])[:12]
+                    )
                     log(
                         "auth_request missing_role traceparent="
                         + str(traceparent_hdr)
@@ -852,6 +870,12 @@ data:
                         + str(client_ip)
                         + " request_id="
                         + str(request_id)
+                        + " aud="
+                        + normalize_claim_value(claims.get("aud"))
+                        + " azp="
+                        + normalize_claim_value(claims.get("azp"))
+                        + " hasura_claim_keys="
+                        + hasura_keys
                     )
                     self.send_response(401)
                     self.end_headers()

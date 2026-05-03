@@ -188,6 +188,22 @@ data:
       return {}
 
 
+    def parse_allowed_roles(value):
+      if isinstance(value, list):
+        return [str(item).strip().lower() for item in value if str(item).strip()]
+      text = str(value or "").strip()
+      if not text:
+        return []
+      if text.startswith("["):
+        try:
+          parsed = json.loads(text)
+          if isinstance(parsed, list):
+            return [str(item).strip().lower() for item in parsed if str(item).strip()]
+        except Exception:
+          pass
+      return [item.strip().lower() for item in text.split(",") if item and item.strip()]
+
+
     def extract_action_input(payload):
       input_data = payload.get("input") or {}
       if (
@@ -227,10 +243,12 @@ data:
       role = str(session_vars.get("x-hasura-role") or "").strip().lower()
       if not role:
         raise RequestError(403, "missing X-Hasura-Role session variable")
+      allowed_roles = parse_allowed_roles(session_vars.get("x-hasura-allowed-roles"))
       payload = {
         "role": role,
         "handler": str(handler_name or "").strip().lower(),
         "operation": str(operation_name or "").strip().lower(),
+        "allowed_roles": allowed_roles,
       }
       req = urllib.request.Request(
         ASYNC_POLICY_URL,

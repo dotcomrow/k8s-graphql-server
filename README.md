@@ -98,6 +98,37 @@ Recommended action input shape:
 }
 ```
 
+### Async Route Authorization (Annotation-Driven)
+
+`publish_async_request` remains a generic carrier. Route-level authorization is enforced by
+`graphql-async-request-publisher` via `graphql-gravitee-sync` policy lookup:
+
+- `handler` + `operation` from action input
+- `x-hasura-role` from session variables
+
+Define allowed roles on the Gravitee API labels (via service annotation
+`gravitee.io/definition-labels`):
+
+- `hasura.async.handler=<handler-name-used-by-mfe>`
+- `hasura.action.roles=<role1|role2|...>` for default handler roles
+- `hasura.async.operation.roles.<operation>=<role1|role2|...>` for operation-specific overrides
+
+Example:
+
+```yaml
+metadata:
+  annotations:
+    gravitee.io/definition-labels: "internal,hasura,hasura.async.handler=ai-service,hasura.action.roles=ai_user"
+```
+
+Operation-specific example:
+
+```yaml
+metadata:
+  annotations:
+    gravitee.io/definition-labels: "internal,hasura,hasura.async.handler=ai-service,hasura.action.roles=user|service,hasura.async.operation.roles.chat.completion=ai_user"
+```
+
 Published Kafka request envelope (`graphql.async.requests.v1`):
 
 ```json

@@ -45,6 +45,12 @@ spec:
               value: "http://hasura.graphql.svc.cluster.local:8080"
             - name: ASYNC_REQUEST_ACTION_HANDLER_URL
               value: "http://graphql-async-request-publisher.graphql.svc.cluster.local:8080/action/publish_async_request"
+            - name: ASYNC_CLIENT_ROLE
+              value: "user"
+            - name: ASYNC_SERVICE_ROLE
+              value: "service"
+            - name: ASYNC_REQUEST_ACTION_ROLES
+              value: "user,service"
           command: ["/bin/sh", "-c"]
           args:
             - |
@@ -214,13 +220,13 @@ spec:
                 metadata_post "${TRACK_PAYLOAD}"
               fi
 
-              if ! permission_exists "user" "select_permissions"; then
-                USER_SELECT_PAYLOAD="$(jq -n --arg source "${SOURCE_NAME}" '{
+              if ! permission_exists "${ASYNC_CLIENT_ROLE}" "select_permissions"; then
+                USER_SELECT_PAYLOAD="$(jq -n --arg source "${SOURCE_NAME}" --arg role "${ASYNC_CLIENT_ROLE}" '{
                   type: "pg_create_select_permission",
                   args: {
                     source: $source,
                     table: { schema: "graphql", name: "client_async_messages" },
-                    role: "user",
+                    role: $role,
                     permission: {
                       columns: [
                         "id", "request_id", "client_id", "status", "request_payload", "response_payload",
@@ -236,13 +242,13 @@ spec:
                 metadata_post "${USER_SELECT_PAYLOAD}"
               fi
 
-              if ! permission_exists "user" "insert_permissions"; then
-                USER_INSERT_PAYLOAD="$(jq -n --arg source "${SOURCE_NAME}" '{
+              if ! permission_exists "${ASYNC_CLIENT_ROLE}" "insert_permissions"; then
+                USER_INSERT_PAYLOAD="$(jq -n --arg source "${SOURCE_NAME}" --arg role "${ASYNC_CLIENT_ROLE}" '{
                   type: "pg_create_insert_permission",
                   args: {
                     source: $source,
                     table: { schema: "graphql", name: "client_async_messages" },
-                    role: "user",
+                    role: $role,
                     permission: {
                       columns: ["request_id", "client_id", "request_payload", "metadata", "kafka_topic", "expires_at"],
                       check: { client_id: { _eq: "X-Hasura-User-Id" } }
@@ -252,13 +258,13 @@ spec:
                 metadata_post "${USER_INSERT_PAYLOAD}"
               fi
 
-              if ! permission_exists "service" "select_permissions"; then
-                SERVICE_SELECT_PAYLOAD="$(jq -n --arg source "${SOURCE_NAME}" '{
+              if ! permission_exists "${ASYNC_SERVICE_ROLE}" "select_permissions"; then
+                SERVICE_SELECT_PAYLOAD="$(jq -n --arg source "${SOURCE_NAME}" --arg role "${ASYNC_SERVICE_ROLE}" '{
                   type: "pg_create_select_permission",
                   args: {
                     source: $source,
                     table: { schema: "graphql", name: "client_async_messages" },
-                    role: "service",
+                    role: $role,
                     permission: {
                       columns: [
                         "id", "request_id", "client_id", "status", "request_payload", "response_payload",
@@ -273,13 +279,13 @@ spec:
                 metadata_post "${SERVICE_SELECT_PAYLOAD}"
               fi
 
-              if ! permission_exists "service" "insert_permissions"; then
-                SERVICE_INSERT_PAYLOAD="$(jq -n --arg source "${SOURCE_NAME}" '{
+              if ! permission_exists "${ASYNC_SERVICE_ROLE}" "insert_permissions"; then
+                SERVICE_INSERT_PAYLOAD="$(jq -n --arg source "${SOURCE_NAME}" --arg role "${ASYNC_SERVICE_ROLE}" '{
                   type: "pg_create_insert_permission",
                   args: {
                     source: $source,
                     table: { schema: "graphql", name: "client_async_messages" },
-                    role: "service",
+                    role: $role,
                     permission: {
                       columns: [
                         "request_id", "client_id", "status", "request_payload", "response_payload", "error_payload",
@@ -292,13 +298,13 @@ spec:
                 metadata_post "${SERVICE_INSERT_PAYLOAD}"
               fi
 
-              if ! permission_exists "service" "update_permissions"; then
-                SERVICE_UPDATE_PAYLOAD="$(jq -n --arg source "${SOURCE_NAME}" '{
+              if ! permission_exists "${ASYNC_SERVICE_ROLE}" "update_permissions"; then
+                SERVICE_UPDATE_PAYLOAD="$(jq -n --arg source "${SOURCE_NAME}" --arg role "${ASYNC_SERVICE_ROLE}" '{
                   type: "pg_create_update_permission",
                   args: {
                     source: $source,
                     table: { schema: "graphql", name: "client_async_messages" },
-                    role: "service",
+                    role: $role,
                     permission: {
                       columns: [
                         "status", "response_payload", "error_payload", "kafka_partition", "kafka_offset",
@@ -347,28 +353,27 @@ spec:
                 metadata_post "${CREATE_ACTION_PAYLOAD}"
               fi
 
-              if ! action_permission_exists "publish_async_request" "user"; then
-                CREATE_ACTION_PERMISSION_USER_PAYLOAD="$(jq -n '{
-                  type: "create_action_permission",
-                  args: {
-                    action: "publish_async_request",
-                    role: "user",
-                    comment: "managed-by=graphql-async-bootstrap async-request-publisher"
-                  }
-                }')"
-                metadata_post "${CREATE_ACTION_PERMISSION_USER_PAYLOAD}"
-              fi
-
-              if ! action_permission_exists "publish_async_request" "service"; then
-                CREATE_ACTION_PERMISSION_SERVICE_PAYLOAD="$(jq -n '{
-                  type: "create_action_permission",
-                  args: {
-                    action: "publish_async_request",
-                    role: "service",
-                    comment: "managed-by=graphql-async-bootstrap async-request-publisher"
-                  }
-                }')"
-                metadata_post "${CREATE_ACTION_PERMISSION_SERVICE_PAYLOAD}"
+              ACTION_ROLES_CSV="$(printf '%s' "${ASYNC_REQUEST_ACTION_ROLES:-${ASYNC_CLIENT_ROLE},${ASYNC_SERVICE_ROLE}}" | tr -d '[:space:]')"
+              if [ -n "${ACTION_ROLES_CSV}" ]; then
+                PREV_IFS="${IFS}"
+                IFS=','
+                for role in ${ACTION_ROLES_CSV}; do
+                  if [ -z "${role}" ]; then
+                    continue
+                  fi
+                  if ! action_permission_exists "publish_async_request" "${role}"; then
+                    CREATE_ACTION_PERMISSION_PAYLOAD="$(jq -n --arg role "${role}" '{
+                      type: "create_action_permission",
+                      args: {
+                        action: "publish_async_request",
+                        role: $role,
+                        comment: "managed-by=graphql-async-bootstrap async-request-publisher"
+                      }
+                    }')"
+                    metadata_post "${CREATE_ACTION_PERMISSION_PAYLOAD}"
+                  fi
+                done
+                IFS="${PREV_IFS}"
               fi
 
               echo "graphql.client_async_messages bootstrap complete"

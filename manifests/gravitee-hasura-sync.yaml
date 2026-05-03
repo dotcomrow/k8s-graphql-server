@@ -82,6 +82,7 @@ data:
 
     OPENAPI_PAGE_TYPES = {"SWAGGER", "OPENAPI"}
     ACTION_MAP = {}
+    ASYNC_POLICY_MAP = {}
     API_DETAIL_CACHE = {}
     ACTION_LOCK = threading.Lock()
     SYNC_LOCK = threading.Lock()
@@ -176,8 +177,27 @@ data:
             return []
         return [item.strip() for item in value.split(",") if item.strip()]
 
+    def parse_multi_delimited(value):
+        if not value:
+            return []
+        if isinstance(value, list):
+            values = []
+            for item in value:
+                values.extend(parse_multi_delimited(item))
+            return values
+        text = str(value)
+        parts = re.split(r"[,\|;]", text)
+        return [item.strip() for item in parts if item and item.strip()]
+
     ACTION_ALLOWED_ROLES = parse_csv(os.environ.get("HASURA_ACTION_ROLES", "user"))
     ACTION_ROLES_LABEL_KEY = os.environ.get("HASURA_ACTION_ROLES_LABEL", "hasura.action.roles")
+    ASYNC_POLICY_DEFAULT_ALLOW = os.environ.get("ASYNC_POLICY_DEFAULT_ALLOW", "true").lower() in ("1", "true", "yes")
+    ASYNC_HANDLER_LABEL_KEY = os.environ.get("ASYNC_HANDLER_LABEL", "hasura.async.handler")
+    ASYNC_HANDLERS_LABEL_KEY = os.environ.get("ASYNC_HANDLERS_LABEL", "hasura.async.handlers")
+    ASYNC_OPERATION_ROLES_LABEL_PREFIX = os.environ.get(
+        "ASYNC_OPERATION_ROLES_LABEL_PREFIX",
+        "hasura.async.operation.roles.",
+    )
     USER_ID_CLAIM = os.environ.get("USER_ID_CLAIM", "sub")
     USER_EMAIL_CLAIM = os.environ.get("USER_EMAIL_CLAIM", "email")
     USER_USERNAME_CLAIM = os.environ.get("USER_USERNAME_CLAIM", "preferred_username")
@@ -465,6 +485,95 @@ data:
         }
         return schema
 
+    def merge_async_policy(async_policy_map, api, labels):
+        handlers = []
+        primary_handler = str(labels.get(ASYNC_HANDLER_LABEL_KEY) or "").strip()
+        if primary_handler:
+            handlers.append(primary_handler)
+        handlers.extend(parse_multi_delimited(labels.get(ASYNC_HANDLERS_LABEL_KEY, "")))
+        handlers = sorted({item.strip().lower() for item in handlers if str(item).strip()})
+        if not handlers:
+            return
+
+        default_roles = sorted(
+            {
+                role.strip().lower()
+                for role in parse_multi_delimited(labels.get(ACTION_ROLES_LABEL_KEY, ""))
+                if role and role.strip()
+            }
+        )
+
+        operation_roles = {}
+        for key, value in labels.items():
+            key_text = str(key)
+            if not key_text.startswith(ASYNC_OPERATION_ROLES_LABEL_PREFIX):
+                continue
+            operation = key_text[len(ASYNC_OPERATION_ROLES_LABEL_PREFIX):].strip().lower()
+            if not operation:
+                continue
+            roles = sorted(
+                {
+                    role.strip().lower()
+                    for role in parse_multi_delimited(value)
+                    if role and role.strip()
+                }
+            )
+            if roles:
+                operation_roles[operation] = roles
+
+        api_ref = api_id_of(api) or str(api.get("name") or "api")
+        for handler in handlers:
+            entry = async_policy_map.setdefault(
+                handler,
+                {"roles": set(), "operations": {}, "apis": set()},
+            )
+            entry["apis"].add(api_ref)
+            for role in default_roles:
+                entry["roles"].add(role)
+            for operation, roles in operation_roles.items():
+                op_entry = entry["operations"].setdefault(operation, set())
+                for role in roles:
+                    op_entry.add(role)
+
+    def finalize_async_policy_map(async_policy_map):
+        finalized = {}
+        for handler, entry in (async_policy_map or {}).items():
+            roles = sorted(set(entry.get("roles", set())))
+            operations = {}
+            for operation, op_roles in (entry.get("operations") or {}).items():
+                op_set = sorted(set(op_roles or []))
+                if op_set:
+                    operations[str(operation)] = op_set
+            finalized[str(handler)] = {
+                "roles": roles,
+                "operations": operations,
+                "apis": sorted(set(entry.get("apis", set()))),
+            }
+        return finalized
+
+    def authorize_async_route(role, handler, operation):
+        role = str(role or "").strip().lower()
+        handler = str(handler or "").strip().lower()
+        operation = str(operation or "").strip().lower()
+        if not role:
+            return False, "missing_role"
+        if not handler:
+            return False, "missing_handler"
+        with ACTION_LOCK:
+            entry = ASYNC_POLICY_MAP.get(handler)
+        if not entry:
+            return ASYNC_POLICY_DEFAULT_ALLOW, "default_allow_no_handler_policy"
+        operations = entry.get("operations") or {}
+        if operation and operation in operations:
+            allowed_roles = operations.get(operation) or []
+            if not allowed_roles:
+                return False, "operation_policy_empty"
+            return role in allowed_roles, "operation_policy"
+        allowed_roles = entry.get("roles") or []
+        if not allowed_roles:
+            return ASYNC_POLICY_DEFAULT_ALLOW, "default_allow_empty_handler_policy"
+        return role in allowed_roles, "handler_policy"
+
     def merge_metadata(metadata, actions, remote_schemas):
         metadata = dict(metadata or {})
         actions = sorted(actions, key=lambda item: str(item.get("name", "")))
@@ -510,12 +619,14 @@ data:
             actions = []
             remotes = []
             action_mapping = {}
+            async_policy_map = {}
             existing_names = set()
             for api in apis:
                 labels = parse_label_map(api)
                 tags = api.get("tags") or []
                 if not (tag_opt_in(tags) or label_opt_in(labels)):
                     continue
+                merge_async_policy(async_policy_map, api, labels)
                 api_id = api_id_of(api)
                 endpoint = labels.get(ENDPOINT_LABEL_KEY) or build_endpoint_from_context(api, api_id)
                 if not endpoint:
@@ -528,7 +639,7 @@ data:
                     continue
                 spec = find_openapi_spec(api_id)
                 if spec:
-                    action_roles = parse_csv(labels.get(ACTION_ROLES_LABEL_KEY, ""))
+                    action_roles = parse_multi_delimited(labels.get(ACTION_ROLES_LABEL_KEY, ""))
                     if not action_roles:
                         action_roles = ACTION_ALLOWED_ROLES
                     new_actions, mapping = build_actions(api, endpoint, spec, existing_names, action_roles)
@@ -554,10 +665,21 @@ data:
             with ACTION_LOCK:
                 ACTION_MAP.clear()
                 ACTION_MAP.update(action_mapping)
+                ASYNC_POLICY_MAP.clear()
+                ASYNC_POLICY_MAP.update(finalize_async_policy_map(async_policy_map))
             if metadata_changed:
-                log(f"Sync complete: actions={len(actions)} remote_schemas={len(remotes)}")
+                log(
+                    "Sync complete: "
+                    + f"actions={len(actions)} remote_schemas={len(remotes)} "
+                    + f"async_policies={len(ASYNC_POLICY_MAP)}"
+                )
             else:
-                log(f"Sync complete: actions={len(actions)} remote_schemas={len(remotes)} (no metadata changes)")
+                log(
+                    "Sync complete: "
+                    + f"actions={len(actions)} remote_schemas={len(remotes)} "
+                    + f"async_policies={len(ASYNC_POLICY_MAP)} "
+                    + "(no metadata changes)"
+                )
         except Exception as exc:
             log(f"sync error: {exc}")
         finally:
@@ -937,6 +1059,30 @@ data:
         def do_POST(self):
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length) if length else b""
+            if self.path.startswith("/async-policy/authorize"):
+                try:
+                    payload = json.loads(body.decode("utf-8") or "{}")
+                    if not isinstance(payload, dict):
+                        raise ValueError("payload must be a JSON object")
+                    role = payload.get("role")
+                    handler = payload.get("handler")
+                    operation = payload.get("operation")
+                    allowed, source = authorize_async_route(role, handler, operation)
+                    response = {"allowed": bool(allowed), "source": str(source)}
+                    data = json.dumps(response).encode("utf-8")
+                    self.send_response(200 if allowed else 403)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                except Exception as exc:
+                    data = json.dumps({"allowed": False, "error": str(exc)}).encode("utf-8")
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                return
             if self.path.startswith("/webhook"):
                 secret = read_file(WEBHOOK_SECRET_PATH)
                 if secret:
@@ -1299,6 +1445,16 @@ spec:
               value: "hasura.endpoint"
             - name: HASURA_MODE_LABEL
               value: "hasura.mode"
+            - name: HASURA_ACTION_ROLES_LABEL
+              value: "hasura.action.roles"
+            - name: ASYNC_HANDLER_LABEL
+              value: "hasura.async.handler"
+            - name: ASYNC_HANDLERS_LABEL
+              value: "hasura.async.handlers"
+            - name: ASYNC_OPERATION_ROLES_LABEL_PREFIX
+              value: "hasura.async.operation.roles."
+            - name: ASYNC_POLICY_DEFAULT_ALLOW
+              value: "true"
             - name: ACTION_HANDLER_URL
               value: "http://graphql-gravitee-sync.graphql.svc.cluster.local:8080/action"
             - name: SYNC_INTERVAL

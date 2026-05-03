@@ -244,6 +244,13 @@ data:
       if not role:
         raise RequestError(403, "missing X-Hasura-Role session variable")
       allowed_roles = parse_allowed_roles(session_vars.get("x-hasura-allowed-roles"))
+      log(
+        "Async policy request "
+        + f"role={role} "
+        + f"allowed_roles={json.dumps(allowed_roles)} "
+        + f"handler={str(handler_name or '').strip().lower()} "
+        + f"operation={str(operation_name or '').strip().lower()}"
+      )
       payload = {
         "role": role,
         "handler": str(handler_name or "").strip().lower(),
@@ -260,8 +267,11 @@ data:
         with urllib.request.urlopen(req, timeout=ASYNC_POLICY_TIMEOUT_SECONDS) as resp:
           raw = resp.read().decode("utf-8")
           response_payload = json.loads(raw or "{}")
+          source = str(response_payload.get("source") or "")
           if bool(response_payload.get("allowed")):
+            log(f"Async policy allowed source={source}")
             return
+          log(f"Async policy denied source={source}")
           raise RequestError(403, "role not allowed for requested async route")
       except urllib.error.HTTPError as exc:
         if exc.code == 403:

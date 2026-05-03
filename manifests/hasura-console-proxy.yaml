@@ -61,9 +61,8 @@ spec:
           cookie_secret = "{{ .Data.data.value }}"
           {{ end }}
           {{ with secret "secret/data/redis" }}
-          {{- $raw := .Data.data.password -}}
-          {{- $enc := $raw | urlquery -}}
-          redis_connection_url = "redis://:{{ $enc }}@redis-0.redis-headless.redis.svc.cluster.local:6379/1"
+          redis_connection_url = "redis://redis.redis.svc.cluster.local:6379/1"
+          redis_password = "{{ .Data.data.password }}"
           {{ end }}
         vault.hashicorp.com/agent-inject-secret-hasura-admin: "secret/data/graphql/hasura-admin"
         vault.hashicorp.com/agent-inject-template-hasura-admin: |
@@ -108,6 +107,9 @@ spec:
             - --cookie-refresh=1h
             - --cookie-expire=8h
             - --session-store-type=redis
+            - --redis-use-sentinel=true
+            - --redis-sentinel-master-name=mymaster
+            - --redis-sentinel-connection-urls=redis://redis-sentinel.redis.svc.cluster.local:26379
             - --reverse-proxy=true
             - --http-address=0.0.0.0:4180
           readinessProbe:

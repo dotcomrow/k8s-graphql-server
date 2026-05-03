@@ -177,6 +177,7 @@ data:
         return [item.strip() for item in value.split(",") if item.strip()]
 
     ACTION_ALLOWED_ROLES = parse_csv(os.environ.get("HASURA_ACTION_ROLES", "user"))
+    ACTION_ROLES_LABEL_KEY = os.environ.get("HASURA_ACTION_ROLES_LABEL", "hasura.action.roles")
     USER_ID_CLAIM = os.environ.get("USER_ID_CLAIM", "sub")
     USER_EMAIL_CLAIM = os.environ.get("USER_EMAIL_CLAIM", "email")
     USER_USERNAME_CLAIM = os.environ.get("USER_USERNAME_CLAIM", "preferred_username")
@@ -407,7 +408,7 @@ data:
                 return spec
         return None
 
-    def build_actions(api, endpoint, spec, existing_names):
+    def build_actions(api, endpoint, spec, existing_names, action_roles):
         actions = []
         mapping = {}
         paths = spec.get("paths") or {}
@@ -438,7 +439,7 @@ data:
                         "arguments": [{"name": "input", "type": "json"}],
                         "output_type": "json",
                     },
-                    "permissions": [{"role": role} for role in ACTION_ALLOWED_ROLES],
+                    "permissions": [{"role": role} for role in action_roles],
                     "comment": f"{MANAGED_COMMENT} api={api_id} method={method_lower} path={path}",
                 })
                 mapping[action_name] = {
@@ -527,7 +528,10 @@ data:
                     continue
                 spec = find_openapi_spec(api_id)
                 if spec:
-                    new_actions, mapping = build_actions(api, endpoint, spec, existing_names)
+                    action_roles = parse_csv(labels.get(ACTION_ROLES_LABEL_KEY, ""))
+                    if not action_roles:
+                        action_roles = ACTION_ALLOWED_ROLES
+                    new_actions, mapping = build_actions(api, endpoint, spec, existing_names, action_roles)
                     actions.extend(new_actions)
                     action_mapping.update(mapping)
                     continue
@@ -681,7 +685,24 @@ data:
             return ""
         return str(value)
 
-    def build_session_vars(hasura_claims, traceparent, tracestate, baggage):
+    def parse_allowed_roles(value):
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return []
+            if text.startswith("["):
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, list):
+                        return [str(item).strip() for item in parsed if str(item).strip()]
+                except Exception:
+                    pass
+            return parse_csv(text)
+        return []
+
+    def build_session_vars(hasura_claims, traceparent, tracestate, baggage, requested_role=None):
         session = {}
         for key, value in hasura_claims.items():
             if not isinstance(key, str):
@@ -695,6 +716,10 @@ data:
             role = hasura_claims.get("x-hasura-default-role") or hasura_claims.get("x-hasura-role")
             if role:
                 session["X-Hasura-Role"] = normalize_claim_value(role)
+        if requested_role:
+            allowed_roles = set(parse_allowed_roles(hasura_claims.get("x-hasura-allowed-roles")))
+            if requested_role in allowed_roles:
+                session["X-Hasura-Role"] = requested_role
         if traceparent:
             session["X-Hasura-Traceparent"] = traceparent
         if tracestate:
@@ -858,7 +883,18 @@ data:
                     or self.headers.get("x-forwarded-baggage")
                     or self.headers.get("X-Forwarded-Baggage")
                 )
-                session_vars = build_session_vars(hasura_claims, traceparent, tracestate, baggage)
+                requested_role = (
+                    self.headers.get("x-hasura-role")
+                    or self.headers.get("X-Hasura-Role")
+                )
+                requested_role = str(requested_role or "").strip()
+                session_vars = build_session_vars(
+                    hasura_claims,
+                    traceparent,
+                    tracestate,
+                    baggage,
+                    requested_role=requested_role or None,
+                )
                 if "X-Hasura-Role" not in session_vars:
                     hasura_keys = ",".join(
                         sorted([key for key in hasura_claims.keys() if isinstance(key, str)])[:12]

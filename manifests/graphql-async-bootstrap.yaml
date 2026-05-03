@@ -220,27 +220,39 @@ spec:
                 metadata_post "${TRACK_PAYLOAD}"
               fi
 
-              if ! permission_exists "${ASYNC_CLIENT_ROLE}" "select_permissions"; then
-                USER_SELECT_PAYLOAD="$(jq -n --arg source "${SOURCE_NAME}" --arg role "${ASYNC_CLIENT_ROLE}" '{
-                  type: "pg_create_select_permission",
+              if permission_exists "${ASYNC_CLIENT_ROLE}" "select_permissions"; then
+                USER_DROP_SELECT_PAYLOAD="$(jq -n --arg source "${SOURCE_NAME}" --arg role "${ASYNC_CLIENT_ROLE}" '{
+                  type: "pg_drop_select_permission",
                   args: {
                     source: $source,
                     table: { schema: "graphql", name: "client_async_messages" },
-                    role: $role,
-                    permission: {
-                      columns: [
-                        "id", "request_id", "client_id", "status", "request_payload", "response_payload",
-                        "error_payload", "kafka_topic", "kafka_partition", "kafka_offset", "metadata",
-                        "created_at", "updated_at", "completed_at", "expires_at"
-                      ],
-                      filter: { client_id: { _eq: "X-Hasura-User-Id" } },
-                      allow_aggregations: true,
-                      limit: 500
-                    }
+                    role: $role
                   }
                 }')"
-                metadata_post "${USER_SELECT_PAYLOAD}"
+                metadata_post "${USER_DROP_SELECT_PAYLOAD}"
               fi
+
+              USER_SELECT_PAYLOAD="$(jq -n --arg source "${SOURCE_NAME}" --arg role "${ASYNC_CLIENT_ROLE}" '{
+                type: "pg_create_select_permission",
+                args: {
+                  source: $source,
+                  table: { schema: "graphql", name: "client_async_messages" },
+                  role: $role,
+                  permission: {
+                    columns: [
+                      "id", "request_id", "client_id", "status", "request_payload", "response_payload",
+                      "error_payload", "kafka_topic", "kafka_partition", "kafka_offset", "metadata",
+                      "created_at", "updated_at", "completed_at", "expires_at"
+                    ],
+                    filter: { client_id: { _eq: "X-Hasura-User-Id" } },
+                    allow_aggregations: true,
+                    limit: 500,
+                    query_root_fields: ["select", "select_by_pk", "select_aggregate"],
+                    subscription_root_fields: ["select", "select_by_pk", "select_aggregate"]
+                  }
+                }
+              }')"
+              metadata_post "${USER_SELECT_PAYLOAD}"
 
               if ! permission_exists "${ASYNC_CLIENT_ROLE}" "insert_permissions"; then
                 USER_INSERT_PAYLOAD="$(jq -n --arg source "${SOURCE_NAME}" --arg role "${ASYNC_CLIENT_ROLE}" '{
@@ -258,26 +270,38 @@ spec:
                 metadata_post "${USER_INSERT_PAYLOAD}"
               fi
 
-              if ! permission_exists "${ASYNC_SERVICE_ROLE}" "select_permissions"; then
-                SERVICE_SELECT_PAYLOAD="$(jq -n --arg source "${SOURCE_NAME}" --arg role "${ASYNC_SERVICE_ROLE}" '{
-                  type: "pg_create_select_permission",
+              if permission_exists "${ASYNC_SERVICE_ROLE}" "select_permissions"; then
+                SERVICE_DROP_SELECT_PAYLOAD="$(jq -n --arg source "${SOURCE_NAME}" --arg role "${ASYNC_SERVICE_ROLE}" '{
+                  type: "pg_drop_select_permission",
                   args: {
                     source: $source,
                     table: { schema: "graphql", name: "client_async_messages" },
-                    role: $role,
-                    permission: {
-                      columns: [
-                        "id", "request_id", "client_id", "status", "request_payload", "response_payload",
-                        "error_payload", "kafka_topic", "kafka_partition", "kafka_offset", "metadata",
-                        "created_at", "updated_at", "completed_at", "expires_at"
-                      ],
-                      filter: {},
-                      allow_aggregations: true
-                    }
+                    role: $role
                   }
                 }')"
-                metadata_post "${SERVICE_SELECT_PAYLOAD}"
+                metadata_post "${SERVICE_DROP_SELECT_PAYLOAD}"
               fi
+
+              SERVICE_SELECT_PAYLOAD="$(jq -n --arg source "${SOURCE_NAME}" --arg role "${ASYNC_SERVICE_ROLE}" '{
+                type: "pg_create_select_permission",
+                args: {
+                  source: $source,
+                  table: { schema: "graphql", name: "client_async_messages" },
+                  role: $role,
+                  permission: {
+                    columns: [
+                      "id", "request_id", "client_id", "status", "request_payload", "response_payload",
+                      "error_payload", "kafka_topic", "kafka_partition", "kafka_offset", "metadata",
+                      "created_at", "updated_at", "completed_at", "expires_at"
+                    ],
+                    filter: {},
+                    allow_aggregations: true,
+                    query_root_fields: ["select", "select_by_pk", "select_aggregate"],
+                    subscription_root_fields: ["select", "select_by_pk", "select_aggregate"]
+                  }
+                }
+              }')"
+              metadata_post "${SERVICE_SELECT_PAYLOAD}"
 
               if ! permission_exists "${ASYNC_SERVICE_ROLE}" "insert_permissions"; then
                 SERVICE_INSERT_PAYLOAD="$(jq -n --arg source "${SOURCE_NAME}" --arg role "${ASYNC_SERVICE_ROLE}" '{

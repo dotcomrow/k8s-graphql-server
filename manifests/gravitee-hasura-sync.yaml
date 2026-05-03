@@ -1458,7 +1458,7 @@ spec:
             - name: ACTION_HANDLER_URL
               value: "http://graphql-gravitee-sync.graphql.svc.cluster.local:8080/action"
             - name: SYNC_INTERVAL
-              value: "300"
+              value: "60"
             - name: JWT_CLOCK_SKEW_SECONDS
               value: "60"
             - name: ACTION_TIMEOUT_SECONDS

@@ -763,10 +763,23 @@ data:
 
     def decode_jwt(token):
         external_aud = load_external_audience()
-        configs = [
-            {"jwk_url": INTERNAL_JWK_URL, "issuer": INTERNAL_ISSUER, "audience": INTERNAL_AUDIENCE},
-            {"jwk_url": EXTERNAL_JWK_URL, "issuer": EXTERNAL_ISSUER, "audience": external_aud},
-        ]
+        configs = []
+
+        # Keep legacy console-proxy audience support, but also accept the
+        # GraphQL API audience for internal-realm service tokens.
+        internal_audiences = [INTERNAL_AUDIENCE]
+        if external_aud and external_aud not in internal_audiences:
+            internal_audiences.append(external_aud)
+        for audience in internal_audiences:
+            if audience:
+                configs.append(
+                    {"jwk_url": INTERNAL_JWK_URL, "issuer": INTERNAL_ISSUER, "audience": audience}
+                )
+
+        if external_aud:
+            configs.append(
+                {"jwk_url": EXTERNAL_JWK_URL, "issuer": EXTERNAL_ISSUER, "audience": external_aud}
+            )
         last_error = None
         for cfg in configs:
             if not cfg["audience"]:

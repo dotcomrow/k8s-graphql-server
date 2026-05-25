@@ -204,6 +204,45 @@ data:
       return [item.strip().lower() for item in text.split(",") if item and item.strip()]
 
 
+    def normalize_role_name(value):
+      text = str(value or "").strip().lower()
+      if text == "none":
+        return ""
+      return text
+
+
+    def resolve_required_role(input_data, metadata):
+      candidates = [
+        input_data.get("required_role"),
+        input_data.get("requiredRole"),
+        input_data.get("required_role_for_access"),
+        input_data.get("requiredRoleForAccess"),
+        metadata.get("required_role"),
+        metadata.get("requiredRole"),
+        metadata.get("required_role_for_access"),
+        metadata.get("requiredRoleForAccess"),
+      ]
+      for candidate in candidates:
+        normalized = normalize_role_name(candidate)
+        if normalized:
+          return normalized
+      return ""
+
+
+    def ensure_required_role_granted(session_vars, required_role):
+      normalized_required_role = normalize_role_name(required_role)
+      if not normalized_required_role:
+        return
+      active_role = normalize_role_name(session_vars.get("x-hasura-role"))
+      allowed_roles = parse_allowed_roles(session_vars.get("x-hasura-allowed-roles"))
+      allowed_set = {normalize_role_name(item) for item in allowed_roles if normalize_role_name(item)}
+      if active_role == normalized_required_role:
+        return
+      if normalized_required_role in allowed_set:
+        return
+      raise RequestError(403, f"missing required role: {normalized_required_role}")
+
+
     def extract_action_input(payload):
       input_data = payload.get("input") or {}
       if (
@@ -237,17 +276,19 @@ data:
       return session_user_id
 
 
-    def authorize_async_route(session_vars, handler_name, operation_name):
+    def authorize_async_route(session_vars, handler_name, operation_name, required_role=""):
       if not ASYNC_POLICY_ENFORCEMENT:
         return
       role = str(session_vars.get("x-hasura-role") or "").strip().lower()
       if not role:
         raise RequestError(403, "missing X-Hasura-Role session variable")
       allowed_roles = parse_allowed_roles(session_vars.get("x-hasura-allowed-roles"))
+      required_role = normalize_role_name(required_role)
       log(
         "Async policy request "
         + f"role={role} "
         + f"allowed_roles={json.dumps(allowed_roles)} "
+        + f"required_role={required_role} "
         + f"handler={str(handler_name or '').strip().lower()} "
         + f"operation={str(operation_name or '').strip().lower()}"
       )
@@ -256,6 +297,7 @@ data:
         "handler": str(handler_name or "").strip().lower(),
         "operation": str(operation_name or "").strip().lower(),
         "allowed_roles": allowed_roles,
+        "required_role": required_role,
       }
       req = urllib.request.Request(
         ASYNC_POLICY_URL,
@@ -384,9 +426,20 @@ data:
       expires_at = resolve_expiration(input_data, submitted_at)
       handler_name = ensure_required_text(input_data.get("handler"), "handler")
       operation_name = ensure_required_text(input_data.get("operation"), "operation")
-      authorize_async_route(session_vars, handler_name, operation_name)
       payload = input_data.get("payload")
       metadata = parse_optional_object(input_data.get("metadata"), "metadata")
+      required_role = resolve_required_role(input_data, metadata)
+      ensure_required_role_granted(session_vars, required_role)
+      authorize_async_route(
+        session_vars,
+        handler_name,
+        operation_name,
+        required_role=required_role,
+      )
+      if required_role:
+        metadata = dict(metadata)
+        metadata.setdefault("required_role", required_role)
+        metadata.setdefault("requiredRole", required_role)
       priority = parse_priority(input_data)
       reply_topic = str(input_data.get("reply_topic") or KAFKA_RESPONSE_TOPIC).strip()
       if not reply_topic:

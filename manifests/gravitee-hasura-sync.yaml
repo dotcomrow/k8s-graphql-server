@@ -551,19 +551,28 @@ data:
             }
         return finalized
 
-    def authorize_async_route(role, handler, operation, allowed_roles=None):
+    def normalize_role_name(value):
+        text = str(value or "").strip().lower()
+        if text == "none":
+            return ""
+        return text
+
+    def authorize_async_route(role, handler, operation, allowed_roles=None, required_role=None):
         role = str(role or "").strip().lower()
         handler = str(handler or "").strip().lower()
         operation = str(operation or "").strip().lower()
+        required_role = normalize_role_name(required_role)
         allowed = {
-            str(item).strip().lower()
+            normalize_role_name(item)
             for item in (allowed_roles or [])
-            if str(item).strip()
+            if normalize_role_name(item)
         }
         if not role:
             return False, "missing_role"
         if not handler:
             return False, "missing_handler"
+        if required_role and required_role != role and required_role not in allowed:
+            return False, "required_role_not_granted"
         with ACTION_LOCK:
             entry = ASYNC_POLICY_MAP.get(handler)
         if not entry:
@@ -573,7 +582,15 @@ data:
             allowed_roles = operations.get(operation) or []
             if not allowed_roles:
                 return False, "operation_policy_empty"
-            allowed_set = {str(item).strip().lower() for item in allowed_roles if str(item).strip()}
+            allowed_set = {
+                normalize_role_name(item)
+                for item in allowed_roles
+                if normalize_role_name(item)
+            }
+            if required_role:
+                if required_role in allowed_set:
+                    return True, "operation_policy_required_role"
+                return False, "operation_policy_required_role"
             if role in allowed_set:
                 return True, "operation_policy_active_role"
             if allowed.intersection(allowed_set):
@@ -582,7 +599,15 @@ data:
         allowed_roles = entry.get("roles") or []
         if not allowed_roles:
             return ASYNC_POLICY_DEFAULT_ALLOW, "default_allow_empty_handler_policy"
-        allowed_set = {str(item).strip().lower() for item in allowed_roles if str(item).strip()}
+        allowed_set = {
+            normalize_role_name(item)
+            for item in allowed_roles
+            if normalize_role_name(item)
+        }
+        if required_role:
+            if required_role in allowed_set:
+                return True, "handler_policy_required_role"
+            return False, "handler_policy_required_role"
         if role in allowed_set:
             return True, "handler_policy_active_role"
         if allowed.intersection(allowed_set):
@@ -1095,9 +1120,16 @@ data:
                     role = payload.get("role")
                     handler = payload.get("handler")
                     operation = payload.get("operation")
+                    required_role = payload.get("required_role") or payload.get("requiredRole")
                     allowed_roles = payload.get("allowed_roles")
                     allowed_roles = parse_allowed_roles(allowed_roles)
-                    allowed, source = authorize_async_route(role, handler, operation, allowed_roles)
+                    allowed, source = authorize_async_route(
+                        role,
+                        handler,
+                        operation,
+                        allowed_roles,
+                        required_role=required_role,
+                    )
                     response = {"allowed": bool(allowed), "source": str(source)}
                     data = json.dumps(response).encode("utf-8")
                     self.send_response(200 if allowed else 403)

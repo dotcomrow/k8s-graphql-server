@@ -105,6 +105,13 @@ Recommended action input shape:
 
 - `handler` + `operation` from action input
 - `x-hasura-role` from session variables
+- optional `required_role` / `requiredRole` from action input or metadata
+
+When `required_role` is provided (for example from Directus MFE `requiredRole` config), the API
+enforces all of the following before publishing to Kafka:
+
+- caller has that role in `x-hasura-allowed-roles` (or it is the active `x-hasura-role`)
+- Gravitee async policy for the handler/operation also allows that exact role
 
 Define allowed roles on the Gravitee API labels (via service annotation
 `gravitee.io/definition-labels`):

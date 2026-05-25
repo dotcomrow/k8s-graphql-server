@@ -23,6 +23,7 @@ data:
     import urllib.request
     import ssl
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import jwt
     from jwt import PyJWKClient, decode as jwt_decode
 
     MANAGED_COMMENT = "managed-by=gravitee-hasura-sync"
@@ -786,26 +787,61 @@ data:
             _jwks_clients[url] = client
         return client
 
+    def get_unverified_jwt_claims(token):
+        try:
+            claims = jwt.decode(
+                token,
+                options={
+                    "verify_signature": False,
+                    "verify_aud": False,
+                    "verify_iss": False,
+                    "verify_exp": False,
+                    "verify_nbf": False,
+                },
+            )
+            return claims if isinstance(claims, dict) else {}
+        except Exception:
+            return {}
+
+    def get_unverified_jwt_header(token):
+        try:
+            header = jwt.get_unverified_header(token)
+            return header if isinstance(header, dict) else {}
+        except Exception:
+            return {}
+
     def decode_jwt(token):
         external_aud = load_external_audience()
         configs = []
 
         # Keep legacy console-proxy audience support, but also accept the
         # GraphQL API audience for internal-realm service tokens.
-        internal_audiences = [INTERNAL_AUDIENCE]
+        internal_audiences = parse_csv(INTERNAL_AUDIENCE) or [INTERNAL_AUDIENCE]
         if external_aud and external_aud not in internal_audiences:
             internal_audiences.append(external_aud)
-        for audience in internal_audiences:
-            if audience:
-                configs.append(
-                    {"jwk_url": INTERNAL_JWK_URL, "issuer": INTERNAL_ISSUER, "audience": audience}
-                )
 
-        if external_aud:
+        unverified_claims = get_unverified_jwt_claims(token)
+        unverified_header = get_unverified_jwt_header(token)
+        token_issuer = str(unverified_claims.get("iss") or "").strip()
+        token_aud = normalize_claim_value(unverified_claims.get("aud"))
+        token_kid = str(unverified_header.get("kid") or "").strip()
+
+        include_internal = token_issuer in ("", INTERNAL_ISSUER)
+        include_external = token_issuer in ("", EXTERNAL_ISSUER)
+
+        if include_internal:
+            for audience in internal_audiences:
+                if audience:
+                    configs.append(
+                        {"jwk_url": INTERNAL_JWK_URL, "issuer": INTERNAL_ISSUER, "audience": audience}
+                    )
+
+        if include_external and external_aud:
             configs.append(
                 {"jwk_url": EXTERNAL_JWK_URL, "issuer": EXTERNAL_ISSUER, "audience": external_aud}
             )
         last_error = None
+        attempt_errors = []
         for cfg in configs:
             if not cfg["audience"]:
                 continue
@@ -821,9 +857,23 @@ data:
                 )
             except Exception as exc:
                 last_error = exc
+                attempt_errors.append(
+                    f"{cfg['issuer']} aud={cfg['audience']} err={type(exc).__name__}"
+                )
                 continue
         if last_error is not None:
-            log("auth_decode failed reason=" + type(last_error).__name__)
+            log(
+                "auth_decode failed reason="
+                + type(last_error).__name__
+                + " iss="
+                + token_issuer
+                + " aud="
+                + token_aud
+                + " kid="
+                + token_kid
+                + " attempts="
+                + "|".join(attempt_errors[:6])
+            )
         return None
 
     def extract_hasura_claims(claims):

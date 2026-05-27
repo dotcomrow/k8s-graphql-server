@@ -927,7 +927,35 @@ data:
             return parse_csv(text)
         return []
 
-    def build_session_vars(hasura_claims, traceparent, tracestate, baggage, requested_role=None):
+    def extract_jwt_roles(claims):
+        roles = set()
+
+        def add_roles(value):
+            if not isinstance(value, list):
+                return
+            for item in value:
+                role = str(item or "").strip()
+                if role:
+                    roles.add(role)
+
+        if not isinstance(claims, dict):
+            return []
+
+        add_roles(claims.get("roles"))
+
+        realm_access = claims.get("realm_access")
+        if isinstance(realm_access, dict):
+            add_roles(realm_access.get("roles"))
+
+        resource_access = claims.get("resource_access")
+        if isinstance(resource_access, dict):
+            for resource_claims in resource_access.values():
+                if isinstance(resource_claims, dict):
+                    add_roles(resource_claims.get("roles"))
+
+        return sorted(roles)
+
+    def build_session_vars(hasura_claims, jwt_roles, traceparent, tracestate, baggage, requested_role=None):
         session = {}
         for key, value in hasura_claims.items():
             if not isinstance(key, str):
@@ -937,6 +965,8 @@ data:
             else:
                 session_key = key
             session[session_key] = normalize_claim_value(value)
+        if jwt_roles:
+            session["X-Hasura-Auth-Roles"] = normalize_claim_value(jwt_roles)
         if "X-Hasura-Role" not in session:
             role = hasura_claims.get("x-hasura-default-role") or hasura_claims.get("x-hasura-role")
             if role:
@@ -1113,8 +1143,10 @@ data:
                     or self.headers.get("X-Hasura-Role")
                 )
                 requested_role = str(requested_role or "").strip()
+                jwt_roles = extract_jwt_roles(claims)
                 session_vars = build_session_vars(
                     hasura_claims,
+                    jwt_roles,
                     traceparent,
                     tracestate,
                     baggage,

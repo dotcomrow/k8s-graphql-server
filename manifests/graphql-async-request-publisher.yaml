@@ -235,7 +235,16 @@ data:
         return
       active_role = normalize_role_name(session_vars.get("x-hasura-role"))
       allowed_roles = parse_allowed_roles(session_vars.get("x-hasura-allowed-roles"))
-      allowed_set = {normalize_role_name(item) for item in allowed_roles if normalize_role_name(item)}
+      auth_roles = parse_allowed_roles(
+        session_vars.get("x-hasura-auth-roles")
+        or session_vars.get("x-hasura-user-roles")
+        or session_vars.get("x-hasura-jwt-roles")
+      )
+      allowed_set = {
+        normalize_role_name(item)
+        for item in [*allowed_roles, *auth_roles]
+        if normalize_role_name(item)
+      }
       if active_role == normalized_required_role:
         return
       if normalized_required_role in allowed_set:

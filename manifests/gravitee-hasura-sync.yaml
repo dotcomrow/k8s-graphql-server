@@ -572,8 +572,15 @@ data:
             return False, "missing_role"
         if not handler:
             return False, "missing_handler"
-        if required_role and required_role != role and required_role not in allowed:
+        required_role_granted = bool(
+            required_role and (required_role == role or required_role in allowed)
+        )
+        if required_role and not required_role_granted:
             return False, "required_role_not_granted"
+        # When a required role is supplied by module configuration (Directus),
+        # enforce that role end-to-end regardless of static handler annotations.
+        if required_role_granted:
+            return True, "required_role_granted"
         with ACTION_LOCK:
             entry = ASYNC_POLICY_MAP.get(handler)
         if not entry:
@@ -588,10 +595,6 @@ data:
                 for item in allowed_roles
                 if normalize_role_name(item)
             }
-            if required_role:
-                if required_role in allowed_set:
-                    return True, "operation_policy_required_role"
-                return False, "operation_policy_required_role"
             if role in allowed_set:
                 return True, "operation_policy_active_role"
             if allowed.intersection(allowed_set):
@@ -605,10 +608,6 @@ data:
             for item in allowed_roles
             if normalize_role_name(item)
         }
-        if required_role:
-            if required_role in allowed_set:
-                return True, "handler_policy_required_role"
-            return False, "handler_policy_required_role"
         if role in allowed_set:
             return True, "handler_policy_active_role"
         if allowed.intersection(allowed_set):

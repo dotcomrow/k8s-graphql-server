@@ -292,6 +292,12 @@ data:
       if not role:
         raise RequestError(403, "missing X-Hasura-Role session variable")
       allowed_roles = parse_allowed_roles(session_vars.get("x-hasura-allowed-roles"))
+      auth_roles = parse_allowed_roles(
+        session_vars.get("x-hasura-auth-roles")
+        or session_vars.get("x-hasura-user-roles")
+        or session_vars.get("x-hasura-jwt-roles")
+      )
+      allowed_roles = sorted({*allowed_roles, *auth_roles})
       required_role = normalize_role_name(required_role)
       log(
         "Async policy request "

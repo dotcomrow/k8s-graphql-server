@@ -1,0 +1,81 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: graphql-openobserve-tunnel-config
+  namespace: vault
+  annotations:
+    argocd.argoproj.io/sync-wave: "-3"
+    argocd.argoproj.io/sync-options: Replace=true,Force=true
+    reloader.stakater.com/auto: "true"
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      annotations:
+        linkerd.io/inject: "disabled"
+        reloader.stakater.com/auto: "true"
+    spec:
+      restartPolicy: Never
+      serviceAccountName: graphql-vault-init
+      containers:
+        - name: setup-openobserve-tunnel-auth
+          image: hashicorp/vault:1.15.4
+          env:
+            - name: VAULT_ADDR
+              value: "http://vault.vault.svc.cluster.local:8200"
+            - name: AUTH_PATH
+              value: "kubernetes"
+            - name: VAULT_K8S_ROLE
+              value: "graphql-vault-init"
+            - name: OPENOBSERVE_TUNNEL_SA
+              value: "openobserve-cloudflare-tunnel-external-secrets"
+            - name: OPENOBSERVE_TUNNEL_NAMESPACE
+              value: "openobserve"
+            - name: OPENOBSERVE_TUNNEL_ROLE
+              value: "externalsecrets-openobserve"
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              set -euo pipefail
+              VAULT_ADDR="${VAULT_ADDR}"
+              AUTH_PATH="${AUTH_PATH}"
+              VAULT_K8S_ROLE="${VAULT_K8S_ROLE}"
+              OPENOBSERVE_TUNNEL_SA="${OPENOBSERVE_TUNNEL_SA}"
+              OPENOBSERVE_TUNNEL_NAMESPACE="${OPENOBSERVE_TUNNEL_NAMESPACE}"
+              OPENOBSERVE_TUNNEL_ROLE="${OPENOBSERVE_TUNNEL_ROLE}"
+              SA_TOKEN_PATH="/var/run/secrets/kubernetes.io/serviceaccount/token"
+
+              export VAULT_ADDR
+
+              while [ ! -s "$SA_TOKEN_PATH" ]; do
+                echo "Waiting for service account token..."
+                sleep 2
+              done
+
+              while :; do
+                VAULT_TOKEN="$(vault write -field=token auth/"${AUTH_PATH}"/login role="${VAULT_K8S_ROLE}" jwt="$(cat "$SA_TOKEN_PATH")" 2>/dev/null || true)"
+                if [ -n "${VAULT_TOKEN}" ]; then
+                  break
+                fi
+                echo "Vault login failed; retrying in 5s..."
+                sleep 5
+              done
+              export VAULT_TOKEN
+
+              until vault status >/dev/null 2>&1; do
+                echo "Waiting for Vault at ${VAULT_ADDR}..."
+                sleep 5
+              done
+
+              vault policy write "${OPENOBSERVE_TUNNEL_ROLE}" - <<EOF
+              path "secret/data/openobserve-cloudflare-tunnel-token" { capabilities = ["read"] }
+              path "secret/metadata/openobserve-cloudflare-tunnel-token" { capabilities = ["read", "list"] }
+              EOF
+
+              vault write auth/"${AUTH_PATH}"/role/"${OPENOBSERVE_TUNNEL_ROLE}" \
+                bound_service_account_names="${OPENOBSERVE_TUNNEL_SA}" \
+                bound_service_account_namespaces="${OPENOBSERVE_TUNNEL_NAMESPACE}" \
+                policies="${OPENOBSERVE_TUNNEL_ROLE}" \
+                ttl="48h"
+
+              echo "OpenObserve cloudflare tunnel auth role '${OPENOBSERVE_TUNNEL_ROLE}' configured."

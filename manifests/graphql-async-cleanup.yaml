@@ -43,65 +43,65 @@ spec:
               image: postgres:15-alpine
               imagePullPolicy: IfNotPresent
               env:
-            - name: CLEANUP_BATCH_SIZE
-              value: "1000"
-            - name: CLEANUP_MAX_BATCHES
-              value: "100"
-            - name: CLEANUP_DB_RETRY_ATTEMPTS
-              value: "8"
-            - name: CLEANUP_DB_RETRY_DELAY_SECONDS
-              value: "5"
-            - name: CLEANUP_DB_CONNECT_TIMEOUT_SECONDS
-              value: "5"
-          command: ["/bin/sh", "-c"]
-          args:
-            - |
-              set -euo pipefail
+                - name: CLEANUP_BATCH_SIZE
+                  value: "1000"
+                - name: CLEANUP_MAX_BATCHES
+                  value: "100"
+                - name: CLEANUP_DB_RETRY_ATTEMPTS
+                  value: "8"
+                - name: CLEANUP_DB_RETRY_DELAY_SECONDS
+                  value: "5"
+                - name: CLEANUP_DB_CONNECT_TIMEOUT_SECONDS
+                  value: "5"
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -euo pipefail
 
-              wait_for_file() {
+                  wait_for_file() {
                     path="$1"
-                while [ ! -s "$path" ]; do
-                  echo "Waiting for $path..."
-                  sleep 2
-                done
-              }
+                    while [ ! -s "$path" ]; do
+                      echo "Waiting for $path..."
+                      sleep 2
+                    done
+                  }
 
-              psql_with_retry() {
-                query="$1"
-                attempt=1
-                max_attempts="${CLEANUP_DB_RETRY_ATTEMPTS:-8}"
-                retry_delay="${CLEANUP_DB_RETRY_DELAY_SECONDS:-5}"
+                  psql_with_retry() {
+                    query="$1"
+                    attempt=1
+                    max_attempts="${CLEANUP_DB_RETRY_ATTEMPTS:-8}"
+                    retry_delay="${CLEANUP_DB_RETRY_DELAY_SECONDS:-5}"
 
-                while true; do
-                  if query_output="$(psql "${DB_URL}" -v ON_ERROR_STOP=1 -tA -c "${query}" 2>&1)"; then
-                    printf '%s' "${query_output}"
-                    return 0
+                    while true; do
+                      if query_output="$(psql "${DB_URL}" -v ON_ERROR_STOP=1 -tA -c "${query}" 2>&1)"; then
+                        printf '%s' "${query_output}"
+                        return 0
+                      fi
+
+                      if [ "${attempt}" -ge "${max_attempts}" ]; then
+                        echo "psql failed after ${attempt}/${max_attempts} attempts for query:" >&2
+                        echo "${query}" >&2
+                        echo "${query_output}" >&2
+                        return 1
+                      fi
+
+                      echo "psql attempt ${attempt}/${max_attempts} failed; retrying in ${retry_delay}s" >&2
+                      echo "${query_output}" >&2
+                      attempt=$((attempt + 1))
+                      sleep "${retry_delay}"
+                    done
+                  }
+
+                  wait_for_file /vault/secrets/db-url
+                  export PGCONNECT_TIMEOUT="${CLEANUP_DB_CONNECT_TIMEOUT_SECONDS:-5}"
+                  DB_URL="$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' /vault/secrets/db-url)"
+
+                  table_exists="$(psql_with_retry "SELECT to_regclass('graphql.client_async_messages') IS NOT NULL;")"
+                  table_exists="$(echo "${table_exists}" | tr -d '[:space:]')"
+                  if [ "${table_exists}" != "t" ]; then
+                    echo "graphql.client_async_messages not found; skipping cleanup"
+                    exit 0
                   fi
-
-                  if [ "${attempt}" -ge "${max_attempts}" ]; then
-                    echo "psql failed after ${attempt}/${max_attempts} attempts for query:" >&2
-                    echo "${query}" >&2
-                    echo "${query_output}" >&2
-                    return 1
-                  fi
-
-                  echo "psql attempt ${attempt}/${max_attempts} failed; retrying in ${retry_delay}s" >&2
-                  echo "${query_output}" >&2
-                  attempt=$((attempt + 1))
-                  sleep "${retry_delay}"
-                done
-              }
-
-              wait_for_file /vault/secrets/db-url
-              export PGCONNECT_TIMEOUT="${CLEANUP_DB_CONNECT_TIMEOUT_SECONDS:-5}"
-              DB_URL="$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' /vault/secrets/db-url)"
-
-              table_exists="$(psql_with_retry "SELECT to_regclass('graphql.client_async_messages') IS NOT NULL;")"
-              table_exists="$(echo "${table_exists}" | tr -d '[:space:]')"
-              if [ "${table_exists}" != "t" ]; then
-                echo "graphql.client_async_messages not found; skipping cleanup"
-                exit 0
-                fi
 
                   batch_size="${CLEANUP_BATCH_SIZE:-1000}"
                   max_batches="${CLEANUP_MAX_BATCHES:-100}"

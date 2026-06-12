@@ -291,36 +291,8 @@ kind: ServiceAccount
 metadata:
   name: openobserve-rum-proxy
   namespace: openobserve
+
 ---
-apiVersion: external-secrets.io/v1
-kind: ExternalSecret
-metadata:
-  name: openobserve-rum-proxy-secrets
-  namespace: openobserve
-  annotations:
-    argocd.argoproj.io/sync-wave: "3"
-spec:
-  refreshInterval: 1h
-  secretStoreRef:
-    kind: SecretStore
-    name: vault-store-openobserve
-  target:
-    name: openobserve-rum-proxy-secrets
-    creationPolicy: Owner
-    deletionPolicy: Retain
-    template:
-      type: Opaque
-  data:
-    - secretKey: hmac_secret
-      remoteRef:
-        # Vault KVv2 path: secret/data/openobserve-rum-proxy
-        key: openobserve-rum-proxy
-        property: hmac_secret
-    - secretKey: openobserve_api_token
-      remoteRef:
-        # Vault KVv2 path: secret/data/openobserve-rum-proxy
-        key: openobserve-rum-proxy
-        property: openobserve_api_token
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -382,20 +354,8 @@ spec:
             - name: RUM_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: openobserve-rum-proxy-secrets
-                  key: hmac_secret
-                  optional: true
-            - name: RUM_SECRET_FALLBACK
-              valueFrom:
-                secretKeyRef:
                   name: oo-auth-bridge
                   key: hmac_secret
-                  optional: true
-            - name: OPENOBSERVE_API_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: openobserve-rum-proxy-secrets
-                  key: openobserve_api_token
                   optional: true
           volumeMounts:
             - name: rum-proxy-code

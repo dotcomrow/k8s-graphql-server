@@ -33,7 +33,7 @@ spec:
             - name: TUNNEL_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: openobserve-cloudflare-tunnel-token
+                  name: cloudflare-tunnel-openobserve-token
                   key: value
           livenessProbe:
             httpGet:

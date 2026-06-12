@@ -4,6 +4,7 @@ metadata:
   name: cloudflared
   namespace: openobserve
   annotations:
+    reloader.stakater.com/auto: "true"
     argocd.argoproj.io/sync-wave: "4"
 spec:
   replicas: 2
@@ -15,6 +16,7 @@ spec:
       labels:
         app: cloudflared
       annotations:
+        reloader.stakater.com/auto: "true"
         # Keep tunnel pods out of the service mesh unless you intentionally need it there.
         linkerd.io/inject: "disabled"
     spec:

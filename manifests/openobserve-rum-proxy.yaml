@@ -1,0 +1,446 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openobserve-rum-proxy
+  namespace: openobserve
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+  labels:
+    app: openobserve-rum-proxy
+data:
+  openobserve-rum-proxy.py: |
+    #!/usr/bin/env python3
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import base64
+    import hashlib
+    import hmac
+    import json
+    import os
+    import time
+    import urllib.error
+    import urllib.request
+    from urllib.parse import urlparse, urlunparse
+    from typing import Dict, Tuple
+
+    REQUIRED_HEADERS = ("x-rum-timestamp", "x-rum-signature")
+
+
+    def _env(name: str, default: str) -> str:
+        return os.getenv(name, default)
+
+
+    LISTEN_HOST = _env("APP_LISTEN_HOST", "0.0.0.0")
+    LISTEN_PORT = int(_env("APP_LISTEN_PORT", "8080"))
+    UPSTREAM_BASE = _env("OPENOBSERVE_UPSTREAM_BASE", "http://openobserve-router.openobserve.svc.cluster.local:5080")
+    UPSTREAM_PATH = _env("OPENOBSERVE_RUM_PATH", "/api/default/rum")
+    ALLOWED_ORIGINS = [
+        value.strip().lower()
+        for value in _env("ALLOWED_ORIGINS", "*.suncoast.systems").split(",")
+        if value.strip()
+    ]
+    TIMESTAMP_TTL_SECONDS = int(_env("RUM_TIMESTAMP_TTL_SECONDS", "300"))
+    RUM_SECRET = _env("RUM_SECRET", "")
+    if not RUM_SECRET:
+        RUM_SECRET = _env("RUM_SECRET_FALLBACK", "")
+    UPSTREAM_TOKEN = _env("OPENOBSERVE_API_TOKEN", "")
+    AUTH_HEADER_NAME = _env("OPENOBSERVE_AUTH_HEADER_NAME", "Authorization")
+    AUTH_HEADER_SCHEME = _env("OPENOBSERVE_AUTH_HEADER_SCHEME", "Bearer")
+    UPSTREAM_AUTH_HEADER = _env("OPENOBSERVE_AUTH_HEADER", "").strip()
+    ALLOW_NO_ORIGIN = _env("RUM_ALLOW_NO_ORIGIN", "false").lower() in ("1", "true", "yes")
+    REPLAY_CACHE_SECONDS = int(_env("RUM_REPLAY_CACHE_SECONDS", "60"))
+    REPLAY_CACHE: Dict[str, float] = {}
+
+
+    def _json_error(status: int, message: str, detail: str = "") -> Tuple[bytes, int]:
+        payload = {"error": message}
+        if detail:
+            payload["detail"] = detail
+        raw = json.dumps(payload).encode()
+        return raw, status
+
+
+    def _parse_host(value: str) -> str:
+        if not value:
+            return ""
+        parsed = urlparse(value)
+        host = parsed.hostname or value
+        return host.lower().strip()
+
+
+    def _is_allowed_origin(host: str) -> bool:
+        if not ALLOWED_ORIGINS:
+            return True
+        if not host:
+            return False
+        for item in ALLOWED_ORIGINS:
+            if not item:
+                continue
+            if item.startswith("*."):
+                base = item[2:]
+                if host == base or host.endswith(f".{base}"):
+                    return True
+                continue
+            if host == item or host.endswith(f".{item}"):
+                return True
+        return False
+
+
+    def _verify_signature(ts: str, body: bytes, signature: str) -> bool:
+        if not RUM_SECRET:
+            return False
+        try:
+            ts_int = int(ts)
+        except ValueError:
+            return False
+        current = int(time.time())
+        if abs(current - ts_int) > TIMESTAMP_TTL_SECONDS:
+            return False
+        canonical = ts.encode() + b"|" + body
+        expected = hmac.new(RUM_SECRET.encode(), canonical, hashlib.sha256).digest()
+        expected_signature = base64.urlsafe_b64encode(expected).decode().rstrip("=")
+        return hmac.compare_digest(signature, expected_signature)
+
+
+    def _is_replay(signature: str) -> bool:
+        if REPLAY_CACHE_SECONDS <= 0:
+            return False
+        now = time.time()
+        if signature in REPLAY_CACHE and now - REPLAY_CACHE[signature] < REPLAY_CACHE_SECONDS:
+            return True
+        REPLAY_CACHE[signature] = now
+        expired = [key for key, value in REPLAY_CACHE.items() if now - value >= REPLAY_CACHE_SECONDS]
+        for key in expired:
+            del REPLAY_CACHE[key]
+        return False
+
+
+    def _payload_is_valid_rum(body: bytes, content_type: str) -> Tuple[bool, str]:
+        if not body:
+            return False, "empty payload"
+
+        content_type = (content_type or "").split(";", 1)[0].strip().lower()
+        if content_type and content_type != "application/json":
+            return False, f"unsupported content type '{content_type}'"
+
+        decoded = body.decode("utf-8", errors="ignore").strip()
+        if not decoded:
+            return False, "empty payload"
+
+        def _is_valid_item(item) -> bool:
+            if not isinstance(item, (dict, list, tuple)):
+                return False
+            if isinstance(item, dict):
+                return bool(item)
+            return bool(item)
+
+        try:
+            payload = json.loads(decoded)
+            if not _is_valid_item(payload):
+                return False, "payload is empty or not a JSON object/array"
+            return True, ""
+        except json.JSONDecodeError:
+            pass
+
+        lines = [line.strip() for line in decoded.splitlines() if line.strip()]
+        if not lines:
+            return False, "invalid payload"
+        try:
+            for line in lines:
+                value = json.loads(line)
+                if not _is_valid_item(value):
+                    return False, "invalid payload entry"
+        except json.JSONDecodeError as exc:
+            return False, f"payload is not valid JSON ({exc})"
+
+        return True, ""
+
+
+    def _forward(body: bytes, headers: Dict[str, str]) -> Tuple[int, bytes, Dict[str, str]]:
+        target = urlunparse(urlparse(UPSTREAM_BASE)._replace(path=UPSTREAM_PATH))
+        upstream = urllib.request.Request(target, data=body, method="POST")
+        for key, value in headers.items():
+            key_lower = key.lower()
+            if key_lower.startswith("x-rum-"):
+                continue
+            if key_lower in ("content-length", "authorization", "proxy-authorization"):
+                continue
+            upstream.add_header(key, value)
+        if UPSTREAM_AUTH_HEADER:
+            upstream.add_header(AUTH_HEADER_NAME, UPSTREAM_AUTH_HEADER)
+        elif UPSTREAM_TOKEN:
+            upstream.add_header(AUTH_HEADER_NAME, f"{AUTH_HEADER_SCHEME} {UPSTREAM_TOKEN}".strip())
+        else:
+            raise RuntimeError("Proxy upstream auth is not configured.")
+        upstream.add_header("Content-Type", headers.get("Content-Type", "application/json"))
+
+        try:
+            response = urllib.request.urlopen(upstream, timeout=10)
+            status = response.getcode()
+            data = response.read()
+            return status, data, dict(response.headers)
+        except urllib.error.HTTPError as error:
+            return error.code, error.read(), dict(error.headers)
+        except Exception as error:
+            raise error
+
+
+    class RUMProxyHandler(BaseHTTPRequestHandler):
+        server_version = "openobserve-rum-proxy/1.0"
+
+        def log_message(self, format: str, *args) -> None:  # pragma: no cover - container logging
+            return
+
+        def _client_ip(self) -> str:
+            forward = self.headers.get("X-Forwarded-For")
+            return (forward.split(",")[0].strip() if forward else self.client_address[0])
+
+        def _allowed_client(self) -> Tuple[bool, bytes]:
+            if self.path in ("/health", "/healthz"):
+                return True, b""
+            if self.path != "/v1/rum":
+                return False, b'{"error":"not found"}'
+            if self.command != "POST":
+                return False, b'{"error":"method not allowed"}'
+            for header in REQUIRED_HEADERS:
+                if not self.headers.get(header):
+                    return False, b'{"error":"missing authentication headers"}'
+            if not RUM_SECRET:
+                return False, b'{"error":"proxy secret not configured"}'
+            ts = self.headers.get("x-rum-timestamp", "")
+            signature = self.headers.get("x-rum-signature", "")
+            content_length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(content_length) if content_length > 0 else b""
+            valid_payload, payload_error = _payload_is_valid_rum(body, self.headers.get("Content-Type", ""))
+            if not valid_payload:
+                return False, json.dumps({"error":"invalid payload", "detail": payload_error}).encode()
+            if _is_replay(signature):
+                return False, b'{"error":"replay blocked"}'
+            if not _verify_signature(ts, body, signature):
+                return False, b'{"error":"invalid signature or stale timestamp"}'
+            origin_host = _parse_host(self.headers.get("Origin"))
+            if not origin_host:
+                origin_host = _parse_host(self.headers.get("Referer"))
+            if not origin_host and not ALLOW_NO_ORIGIN:
+                return False, b'{"error":"origin not provided"}'
+            if origin_host and not _is_allowed_origin(origin_host):
+                return False, b'{"error":"origin blocked"}'
+
+            return True, body
+
+        def _send(self, status: int, body: bytes, content_type: str = "application/json") -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
+
+        def do_GET(self) -> None:
+            if self.path in ("/health", "/healthz"):
+                self._send(200, b'{"status":"ok"}')
+                return
+            self._send(404, b'{"error":"not found"}')
+
+        def do_OPTIONS(self) -> None:
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", self.headers.get("Origin", "*"))
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, x-rum-timestamp, x-rum-signature")
+            self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+            self.end_headers()
+
+        def do_POST(self) -> None:
+            allowed, body = self._allowed_client()
+            if not allowed:
+                if b'{' in body:
+                    body_out = body
+                    status = 403
+                else:
+                    body_out = b'{"error":"forbidden"}'
+                    status = 403
+                if body in (b'{"error":"method not allowed"}', b'{"error":"missing authentication headers"}', b'{"error":"proxy secret not configured"}', b'{"error":"invalid signature or stale timestamp"}', b'{"error":"origin not provided"}', b'{"error":"origin blocked"}', b'{"error":"replay blocked"}'):
+                    body_out = body
+                    status = 403
+                if body == b'{"error":"not found"}':
+                    status = 404
+                if body == b'{"error":"forbidden"}':
+                    status = 403
+                self._send(status, body_out)
+                return
+
+            try:
+                upstream_status, upstream_body, upstream_headers = _forward(body, dict(self.headers))
+                self.send_response(upstream_status)
+                self.send_header("Content-Type", upstream_headers.get("Content-Type", "application/json"))
+                self.send_header("Content-Length", str(len(upstream_body)))
+                self.send_header("Access-Control-Allow-Origin", self.headers.get("Origin", "*"))
+                self.end_headers()
+                if upstream_body:
+                    self.wfile.write(upstream_body)
+                print(f"{self._client_ip()} POST {self.path} upstream={upstream_status}")
+            except Exception as error:
+                self._send(502, json.dumps({"error": "upstream failure", "detail": str(error)}).encode())
+
+
+    if __name__ == "__main__":
+        server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), RUMProxyHandler)
+        server.serve_forever()
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: openobserve-rum-proxy
+  namespace: openobserve
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: openobserve-rum-proxy-secrets
+  namespace: openobserve
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: SecretStore
+    name: vault-store-openobserve
+  target:
+    name: openobserve-rum-proxy-secrets
+    creationPolicy: Owner
+    deletionPolicy: Retain
+    template:
+      type: Opaque
+  data:
+    - secretKey: hmac_secret
+      remoteRef:
+        # Vault KVv2 path: secret/data/openobserve-rum-proxy
+        key: openobserve-rum-proxy
+        property: hmac_secret
+    - secretKey: openobserve_api_token
+      remoteRef:
+        # Vault KVv2 path: secret/data/openobserve-rum-proxy
+        key: openobserve-rum-proxy
+        property: openobserve_api_token
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openobserve-rum-proxy
+  namespace: openobserve
+  annotations:
+    argocd.argoproj.io/sync-wave: "4"
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: openobserve-rum-proxy
+  template:
+    metadata:
+      labels:
+        app: openobserve-rum-proxy
+      annotations:
+        # Keep this proxy out of the service mesh unless you intentionally need it there.
+        linkerd.io/inject: "disabled"
+        reloader.stakater.com/auto: "true"
+    spec:
+      serviceAccountName: openobserve-rum-proxy
+      containers:
+        - name: rum-proxy
+          image: python:3.12-slim
+          imagePullPolicy: IfNotPresent
+          command:
+            - python
+            - /opt/openobserve-rum-proxy/openobserve-rum-proxy.py
+          env:
+            - name: APP_LISTEN_HOST
+              value: "0.0.0.0"
+            - name: APP_LISTEN_PORT
+              value: "8080"
+            - name: OPENOBSERVE_UPSTREAM_BASE
+              value: "http://openobserve-router.openobserve.svc.cluster.local:5080"
+            - name: OPENOBSERVE_RUM_PATH
+              value: "/api/default/rum"
+            - name: OPENOBSERVE_AUTH_HEADER_NAME
+              value: "Authorization"
+            - name: OPENOBSERVE_AUTH_HEADER_SCHEME
+              value: "Bearer"
+            - name: OPENOBSERVE_AUTH_HEADER
+              valueFrom:
+                secretKeyRef:
+                  name: oo-auth
+                  key: OO_AUTH_HEADER
+                  optional: true
+            - name: ALLOWED_ORIGINS
+              value: "*.suncoast.systems"
+            - name: RUM_TIMESTAMP_TTL_SECONDS
+              value: "300"
+            - name: RUM_REPLAY_CACHE_SECONDS
+              value: "120"
+            - name: RUM_ALLOW_NO_ORIGIN
+              value: "false"
+            - name: RUM_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: openobserve-rum-proxy-secrets
+                  key: hmac_secret
+                  optional: true
+            - name: RUM_SECRET_FALLBACK
+              valueFrom:
+                secretKeyRef:
+                  name: oo-auth-bridge
+                  key: hmac_secret
+                  optional: true
+            - name: OPENOBSERVE_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: openobserve-rum-proxy-secrets
+                  key: openobserve_api_token
+                  optional: true
+          volumeMounts:
+            - name: rum-proxy-code
+              mountPath: /opt/openobserve-rum-proxy
+              readOnly: true
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+      volumes:
+        - name: rum-proxy-code
+          configMap:
+            name: openobserve-rum-proxy
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openobserve-rum-proxy
+  namespace: openobserve
+  annotations:
+    reloader.stakater.com/auto: "true"
+  labels:
+    app: openobserve-rum-proxy
+spec:
+  selector:
+    app: openobserve-rum-proxy
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

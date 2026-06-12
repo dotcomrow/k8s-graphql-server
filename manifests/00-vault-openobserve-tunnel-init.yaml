@@ -70,6 +70,8 @@ spec:
               vault policy write "${OPENOBSERVE_TUNNEL_ROLE}" - <<EOF
               path "secret/data/cloudflare-tunnel-openobserve-token" { capabilities = ["read"] }
               path "secret/metadata/cloudflare-tunnel-openobserve-token" { capabilities = ["read", "list"] }
+              path "secret/data/openobserve-rum-proxy" { capabilities = ["read"] }
+              path "secret/metadata/openobserve-rum-proxy" { capabilities = ["read", "list"] }
               EOF
 
               vault write auth/"${AUTH_PATH}"/role/"${OPENOBSERVE_TUNNEL_ROLE}" \

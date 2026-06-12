@@ -19,26 +19,38 @@ data:
     import time
     import urllib.error
     import urllib.request
+    from collections import deque, defaultdict
     from urllib.parse import urlparse, urlunparse
     from typing import Dict, Tuple
 
     REQUIRED_HEADERS = ("x-rum-timestamp", "x-rum-signature")
-
-
     def _env(name: str, default: str) -> str:
         return os.getenv(name, default)
 
+    def _required_headers(path: str) -> Tuple[str, str]:
+        if path == "/v1/logs":
+            headers = tuple(
+                value.strip()
+                for value in _env("LOG_REQUIRED_HEADERS", "x-rum-timestamp,x-rum-signature").split(",")
+                if value.strip()
+            )
+            if len(headers) == 2:
+                return headers[0], headers[1]
+            return ("x-rum-timestamp", "x-rum-signature")
+        return REQUIRED_HEADERS
 
     LISTEN_HOST = _env("APP_LISTEN_HOST", "0.0.0.0")
     LISTEN_PORT = int(_env("APP_LISTEN_PORT", "8080"))
     UPSTREAM_BASE = _env("OPENOBSERVE_UPSTREAM_BASE", "http://openobserve-router.openobserve.svc.cluster.local:5080")
     UPSTREAM_PATH = _env("OPENOBSERVE_RUM_PATH", "/api/default/rum")
+    UPSTREAM_LOGS_PATH = _env("OPENOBSERVE_LOGS_PATH", "/api/default/logs")
     ALLOWED_ORIGINS = [
         value.strip().lower()
         for value in _env("ALLOWED_ORIGINS", "*.suncoast.systems").split(",")
         if value.strip()
     ]
     TIMESTAMP_TTL_SECONDS = int(_env("RUM_TIMESTAMP_TTL_SECONDS", "300"))
+    MAX_PAYLOAD_BYTES = int(_env("OPENOBSERVE_MAX_PAYLOAD_BYTES", "1048576"))
     RUM_SECRET = _env("RUM_SECRET", "")
     if not RUM_SECRET:
         RUM_SECRET = _env("RUM_SECRET_FALLBACK", "")
@@ -48,7 +60,12 @@ data:
     UPSTREAM_AUTH_HEADER = _env("OPENOBSERVE_AUTH_HEADER", "").strip()
     ALLOW_NO_ORIGIN = _env("RUM_ALLOW_NO_ORIGIN", "false").lower() in ("1", "true", "yes")
     REPLAY_CACHE_SECONDS = int(_env("RUM_REPLAY_CACHE_SECONDS", "60"))
+    RUM_RATE_LIMIT_WINDOW_SECONDS = int(_env("RUM_RATE_LIMIT_WINDOW_SECONDS", "60"))
+    RUM_RATE_LIMIT_MAX_REQUESTS = int(_env("RUM_RATE_LIMIT_MAX_REQUESTS", "120"))
+    LOG_RATE_LIMIT_WINDOW_SECONDS = int(_env("LOG_RATE_LIMIT_WINDOW_SECONDS", "60"))
+    LOG_RATE_LIMIT_MAX_REQUESTS = int(_env("LOG_RATE_LIMIT_MAX_REQUESTS", "180"))
     REPLAY_CACHE: Dict[str, float] = {}
+    RATE_LIMIT_CACHE: Dict[str, deque] = defaultdict(deque)
 
 
     def _json_error(status: int, message: str, detail: str = "") -> Tuple[bytes, int]:
@@ -114,12 +131,47 @@ data:
         return False
 
 
+    def _is_rate_limited(path: str, client: str) -> bool:
+        if client:
+            key = f"{path}|{client}"
+        else:
+            key = path
+
+        if path == "/v1/logs":
+            window_seconds = LOG_RATE_LIMIT_WINDOW_SECONDS
+            max_requests = LOG_RATE_LIMIT_MAX_REQUESTS
+        else:
+            window_seconds = RUM_RATE_LIMIT_WINDOW_SECONDS
+            max_requests = RUM_RATE_LIMIT_MAX_REQUESTS
+
+        if window_seconds <= 0 or max_requests <= 0:
+            return False
+
+        bucket = RATE_LIMIT_CACHE[key]
+        now = time.time()
+        cutoff = now - window_seconds
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+
+        if len(bucket) >= max_requests:
+            return True
+
+        bucket.append(now)
+        return False
+
+
+    def _upstream_path(path: str) -> str:
+        if path == "/v1/logs":
+            return UPSTREAM_LOGS_PATH
+        return UPSTREAM_PATH
+
+
     def _payload_is_valid_rum(body: bytes, content_type: str) -> Tuple[bool, str]:
         if not body:
             return False, "empty payload"
 
         content_type = (content_type or "").split(";", 1)[0].strip().lower()
-        if content_type and content_type != "application/json":
+        if content_type and content_type not in ("application/json", "application/x-ndjson", "text/plain"):
             return False, f"unsupported content type '{content_type}'"
 
         decoded = body.decode("utf-8", errors="ignore").strip()
@@ -155,8 +207,8 @@ data:
         return True, ""
 
 
-    def _forward(body: bytes, headers: Dict[str, str]) -> Tuple[int, bytes, Dict[str, str]]:
-        target = urlunparse(urlparse(UPSTREAM_BASE)._replace(path=UPSTREAM_PATH))
+    def _forward(body: bytes, headers: Dict[str, str], path: str) -> Tuple[int, bytes, Dict[str, str]]:
+        target = urlunparse(urlparse(UPSTREAM_BASE)._replace(path=_upstream_path(path)))
         upstream = urllib.request.Request(target, data=body, method="POST")
         for key, value in headers.items():
             key_lower = key.lower()
@@ -197,22 +249,27 @@ data:
         def _allowed_client(self) -> Tuple[bool, bytes]:
             if self.path in ("/health", "/healthz"):
                 return True, b""
-            if self.path != "/v1/rum":
+            if self.path not in ("/v1/rum", "/v1/logs"):
                 return False, b'{"error":"not found"}'
             if self.command != "POST":
                 return False, b'{"error":"method not allowed"}'
-            for header in REQUIRED_HEADERS:
+            required_headers = _required_headers(self.path)
+            for header in required_headers:
                 if not self.headers.get(header):
                     return False, b'{"error":"missing authentication headers"}'
             if not RUM_SECRET:
                 return False, b'{"error":"proxy secret not configured"}'
-            ts = self.headers.get("x-rum-timestamp", "")
-            signature = self.headers.get("x-rum-signature", "")
+            ts = self.headers.get(required_headers[0], "")
+            signature = self.headers.get(required_headers[1], "")
             content_length = int(self.headers.get("Content-Length", "0"))
+            if content_length > MAX_PAYLOAD_BYTES:
+                return False, b'{"error":"payload too large"}'
             body = self.rfile.read(content_length) if content_length > 0 else b""
             valid_payload, payload_error = _payload_is_valid_rum(body, self.headers.get("Content-Type", ""))
             if not valid_payload:
                 return False, json.dumps({"error":"invalid payload", "detail": payload_error}).encode()
+            if _is_rate_limited(self.path, self._client_ip()):
+                return False, b'{"error":"rate limit exceeded"}'
             if _is_replay(signature):
                 return False, b'{"error":"replay blocked"}'
             if not _verify_signature(ts, body, signature):
@@ -244,7 +301,7 @@ data:
         def do_OPTIONS(self) -> None:
             self.send_response(204)
             self.send_header("Access-Control-Allow-Origin", self.headers.get("Origin", "*"))
-            self.send_header("Access-Control-Allow-Headers", "Content-Type, x-rum-timestamp, x-rum-signature")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, x-rum-timestamp, x-rum-signature, x-log-timestamp, x-log-signature")
             self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
             self.end_headers()
 
@@ -257,18 +314,31 @@ data:
                 else:
                     body_out = b'{"error":"forbidden"}'
                     status = 403
-                if body in (b'{"error":"method not allowed"}', b'{"error":"missing authentication headers"}', b'{"error":"proxy secret not configured"}', b'{"error":"invalid signature or stale timestamp"}', b'{"error":"origin not provided"}', b'{"error":"origin blocked"}', b'{"error":"replay blocked"}'):
+                if body in (
+                    b'{"error":"method not allowed"}',
+                    b'{"error":"missing authentication headers"}',
+                    b'{"error":"proxy secret not configured"}',
+                    b'{"error":"invalid signature or stale timestamp"}',
+                    b'{"error":"origin not provided"}',
+                    b'{"error":"origin blocked"}',
+                    b'{"error":"replay blocked"}',
+                    b'{"error":"payload too large"}',
+                ):
                     body_out = body
                     status = 403
                 if body == b'{"error":"not found"}':
                     status = 404
+                if body == b'{"error":"rate limit exceeded"}':
+                    status = 429
+                if body == b'{"error":"payload too large"}':
+                    status = 413
                 if body == b'{"error":"forbidden"}':
                     status = 403
                 self._send(status, body_out)
                 return
 
             try:
-                upstream_status, upstream_body, upstream_headers = _forward(body, dict(self.headers))
+                upstream_status, upstream_body, upstream_headers = _forward(body, dict(self.headers), self.path)
                 self.send_response(upstream_status)
                 self.send_header("Content-Type", upstream_headers.get("Content-Type", "application/json"))
                 self.send_header("Content-Length", str(len(upstream_body)))
@@ -332,6 +402,18 @@ spec:
               value: "http://openobserve-router.openobserve.svc.cluster.local:5080"
             - name: OPENOBSERVE_RUM_PATH
               value: "/api/default/rum"
+            - name: OPENOBSERVE_LOGS_PATH
+              value: "/api/default/logs"
+            - name: OPENOBSERVE_MAX_PAYLOAD_BYTES
+              value: "262144"
+            - name: RUM_RATE_LIMIT_WINDOW_SECONDS
+              value: "60"
+            - name: RUM_RATE_LIMIT_MAX_REQUESTS
+              value: "120"
+            - name: LOG_RATE_LIMIT_WINDOW_SECONDS
+              value: "60"
+            - name: LOG_RATE_LIMIT_MAX_REQUESTS
+              value: "240"
             - name: OPENOBSERVE_AUTH_HEADER_NAME
               value: "Authorization"
             - name: OPENOBSERVE_AUTH_HEADER_SCHEME

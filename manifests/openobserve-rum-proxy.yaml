@@ -27,19 +27,31 @@ data:
     RUM_PATH_CANONICAL_MAP = {
       "/v1/rum": [
         "/v1/rum",
+        "/v1/rum/_json",
         "/rum/v1/default/rum",
+        "/rum/v1/default/rum/_json",
         "/v1/default/rum",
+        "/v1/default/rum/_json",
         "/api/default/rum",
+        "/api/default/rum/_json",
         "/api/default/v1/rum",
         "/api/log/events/v1/rum",
+        "/api/log/events/v1/rum/_json",
+        "/api/v1/rum/_json",
       ],
       "/v1/logs": [
         "/v1/logs",
+        "/v1/logs/_json",
         "/rum/v1/default/logs",
+        "/rum/v1/default/logs/_json",
         "/v1/default/logs",
+        "/v1/default/logs/_json",
         "/api/default/logs",
+        "/api/default/logs/_json",
         "/api/default/v1/logs",
         "/api/log/events/v1/logs",
+        "/api/log/events/v1/logs/_json",
+        "/api/v1/logs/_json",
       ],
     }
 
@@ -432,9 +444,9 @@ spec:
             - name: OPENOBSERVE_UPSTREAM_BASE
               value: "http://openobserve-router.openobserve.svc.cluster.local:5080"
             - name: OPENOBSERVE_RUM_PATH
-              value: "/api/default/rum"
+              value: "/api/default/rum/_json"
             - name: OPENOBSERVE_LOGS_PATH
-              value: "/api/default/logs"
+              value: "/api/default/logs/_json"
             - name: OPENOBSERVE_MAX_PAYLOAD_BYTES
               value: "262144"
             - name: RUM_RATE_LIMIT_WINDOW_SECONDS

@@ -24,8 +24,40 @@ data:
     from typing import Dict, Tuple
 
     REQUIRED_HEADERS = ("x-rum-timestamp", "x-rum-signature")
+    RUM_PATH_CANONICAL_MAP = {
+      "/v1/rum": [
+        "/v1/rum",
+        "/rum/v1/default/rum",
+        "/v1/default/rum",
+        "/api/default/rum",
+        "/api/default/v1/rum",
+        "/api/log/events/v1/rum",
+      ],
+      "/v1/logs": [
+        "/v1/logs",
+        "/rum/v1/default/logs",
+        "/v1/default/logs",
+        "/api/default/logs",
+        "/api/default/v1/logs",
+        "/api/log/events/v1/logs",
+      ],
+    }
+
     def _env(name: str, default: str) -> str:
         return os.getenv(name, default)
+
+    def _normalize_path(value: str) -> str:
+        return (value or "/").split("?", 1)[0].rstrip("/") or "/"
+
+    def _canonical_path(path: str) -> str:
+        normalized_path = _normalize_path(path)
+        for canonical, aliases in RUM_PATH_CANONICAL_MAP.items():
+            if normalized_path in aliases:
+                return canonical
+            for alias in aliases:
+                if normalized_path.endswith(alias):
+                    return canonical
+        return normalized_path if normalized_path in ("/v1/rum", "/v1/logs") else ""
 
     def _required_headers(path: str) -> Tuple[str, str]:
         if path == "/v1/logs":
@@ -208,7 +240,7 @@ data:
 
 
     def _forward(body: bytes, headers: Dict[str, str], path: str) -> Tuple[int, bytes, Dict[str, str]]:
-        target = urlunparse(urlparse(UPSTREAM_BASE)._replace(path=_upstream_path(path)))
+        target = urlunparse(urlparse(UPSTREAM_BASE)._replace(path=_upstream_path(_canonical_path(path))))
         upstream = urllib.request.Request(target, data=body, method="POST")
         for key, value in headers.items():
             key_lower = key.lower()
@@ -249,11 +281,12 @@ data:
         def _allowed_client(self) -> Tuple[bool, bytes]:
             if self.path in ("/health", "/healthz"):
                 return True, b""
-            if self.path not in ("/v1/rum", "/v1/logs"):
+            canonical_path = _canonical_path(self.path)
+            if not canonical_path:
                 return False, b'{"error":"not found"}'
             if self.command != "POST":
                 return False, b'{"error":"method not allowed"}'
-            required_headers = _required_headers(self.path)
+            required_headers = _required_headers(canonical_path)
             for header in required_headers:
                 if not self.headers.get(header):
                     return False, b'{"error":"missing authentication headers"}'
@@ -268,7 +301,7 @@ data:
             valid_payload, payload_error = _payload_is_valid_rum(body, self.headers.get("Content-Type", ""))
             if not valid_payload:
                 return False, json.dumps({"error":"invalid payload", "detail": payload_error}).encode()
-            if _is_rate_limited(self.path, self._client_ip()):
+            if _is_rate_limited(canonical_path, self._client_ip()):
                 return False, b'{"error":"rate limit exceeded"}'
             if _is_replay(signature):
                 return False, b'{"error":"replay blocked"}'
@@ -423,7 +456,7 @@ spec:
                 secretKeyRef:
                   name: oo-auth
                   key: OO_AUTH_HEADER
-                  optional: true
+                  optional: false
             - name: ALLOWED_ORIGINS
               value: "*.suncoast.systems"
             - name: RUM_TIMESTAMP_TTL_SECONDS
@@ -437,7 +470,7 @@ spec:
                 secretKeyRef:
                   name: oo-auth-bridge
                   key: hmac_secret
-                  optional: true
+                  optional: false
           volumeMounts:
             - name: rum-proxy-code
               mountPath: /opt/openobserve-rum-proxy

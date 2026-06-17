@@ -255,14 +255,19 @@ data:
         if not values:
             return False, b"", "application/json", "payload has no JSON values"
 
-        # Single top-level object/array stays JSON; multi-value payloads become NDJSON.
-        if len(values) == 1:
-            normalized_body = json.dumps(values[0], separators=(",", ":")).encode("utf-8")
-            normalized_content_type = "application/json"
+        # /api/{org}/{stream}/_json ingesters expect JSON-array batches.
+        if len(values) == 1 and isinstance(values[0], list):
+            records = values[0]
+        elif len(values) == 1:
+            records = [values[0]]
         else:
-            normalized_lines = [json.dumps(value, separators=(",", ":")) for value in values]
-            normalized_body = ("\n".join(normalized_lines)).encode("utf-8")
-            normalized_content_type = "application/x-ndjson"
+            records = values
+
+        if not records:
+            return False, b"", "application/json", "payload has no records after normalization"
+
+        normalized_body = json.dumps(records, separators=(",", ":")).encode("utf-8")
+        normalized_content_type = "application/json"
         return True, normalized_body, normalized_content_type, ""
 
     def _forward(body: bytes, headers: Dict[str, str], path: str, content_type: str) -> Tuple[int, bytes, Dict[str, str]]:

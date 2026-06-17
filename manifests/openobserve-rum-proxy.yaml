@@ -268,13 +268,27 @@ data:
             return values
 
 
+    def _coerce_scalar(value):
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        if isinstance(value, (dict, list, tuple)):
+            return json.dumps(value, separators=(",", ":"))
+        return str(value)
+
+
+    def _coerce_record(record: dict) -> dict:
+        if not isinstance(record, dict):
+            return {"value": _coerce_scalar(record)}
+        return {str(key): _coerce_scalar(value) for key, value in record.items()}
+
+
     def _flatten_records(values: list) -> list[dict]:
         records: list[dict] = []
         for value in values:
             if isinstance(value, tuple):
                 value = list(value)
             if isinstance(value, dict):
-                records.append(value)
+                records.append(_coerce_record(value))
                 continue
             if isinstance(value, (list, tuple)):
                 if not value:
@@ -312,7 +326,6 @@ data:
             return False, b"", "application/json", f"payload shape invalid ({exc})"
 
         # /api/{org}/{stream}/_json ingesters expect JSON-array batches.
-
         if not records:
             return False, b"", "application/json", "payload has no records after normalization"
 
@@ -320,26 +333,60 @@ data:
         normalized_content_type = "application/json"
         return True, normalized_body, normalized_content_type, ""
 
-    def _forward(body: bytes, headers: Dict[str, str], path: str, content_type: str) -> Tuple[int, bytes, Dict[str, str]]:
-        target = urlunparse(urlparse(UPSTREAM_BASE)._replace(path=_upstream_path(_canonical_path(path))))
-        upstream = urllib.request.Request(target, data=body, method="POST")
+
+    def _rewrap_batch(body: bytes) -> bytes:
+        if not body:
+            return body
+        try:
+            decoded = body.decode("utf-8")
+        except UnicodeDecodeError:
+            return body
+        try:
+            values = _decode_json_values(decoded)
+            records = _flatten_records(values)
+            rewritten = json.dumps([_coerce_record(r) for r in records], separators=(",", ":")).encode("utf-8")
+            return rewritten
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return body
+
+
+    def _is_trailing_error(body: bytes) -> bool:
+        if not body:
+            return False
+        text = body.decode("utf-8", errors="ignore").lower()
+        return "trailing characters at line" in text
+
+
+    def _send_to_upstream(target: str, body: bytes, headers: Dict[str, str], content_type: str) -> Tuple[int, bytes, Dict[str, str]]:
+        request = urllib.request.Request(target, data=body, method="POST")
         for key, value in headers.items():
             key_lower = key.lower()
             if key_lower.startswith("x-rum-"):
                 continue
-            if key_lower in ("content-length", "authorization", "proxy-authorization"):
+            if key_lower in (
+                "content-length",
+                "authorization",
+                "proxy-authorization",
+                "connection",
+                "proxy-connection",
+                "transfer-encoding",
+                "keep-alive",
+                "te",
+                "trailer",
+                "upgrade",
+            ):
                 continue
-            upstream.add_header(key, value)
+            request.add_header(key, value)
         if UPSTREAM_AUTH_HEADER:
-            upstream.add_header(AUTH_HEADER_NAME, UPSTREAM_AUTH_HEADER)
+            request.add_header(AUTH_HEADER_NAME, UPSTREAM_AUTH_HEADER)
         elif UPSTREAM_TOKEN:
-            upstream.add_header(AUTH_HEADER_NAME, f"{AUTH_HEADER_SCHEME} {UPSTREAM_TOKEN}".strip())
+            request.add_header(AUTH_HEADER_NAME, f"{AUTH_HEADER_SCHEME} {UPSTREAM_TOKEN}".strip())
         else:
             raise RuntimeError("Proxy upstream auth is not configured.")
-        upstream.add_header("Content-Type", content_type or headers.get("Content-Type", "application/json"))
+        request.add_header("Content-Type", content_type or headers.get("Content-Type", "application/json"))
 
         try:
-            response = urllib.request.urlopen(upstream, timeout=10)
+            response = urllib.request.urlopen(request, timeout=10)
             status = response.getcode()
             data = response.read()
             return status, data, dict(response.headers)
@@ -347,6 +394,16 @@ data:
             return error.code, error.read(), dict(error.headers)
         except Exception as error:
             raise error
+
+    def _forward(body: bytes, headers: Dict[str, str], path: str, content_type: str) -> Tuple[int, bytes, Dict[str, str]]:
+        target = urlunparse(urlparse(UPSTREAM_BASE)._replace(path=_upstream_path(_canonical_path(path))))
+        normalized_body = _rewrap_batch(body)
+        status, upstream_body, upstream_headers = _send_to_upstream(target, normalized_body, headers, content_type)
+        if status == 400 and _is_trailing_error(upstream_body):
+            fallback_body = _rewrap_batch(normalized_body)
+            if fallback_body != normalized_body:
+                status, upstream_body, upstream_headers = _send_to_upstream(target, fallback_body, headers, content_type)
+        return status, upstream_body, upstream_headers
 
 
     class RUMProxyHandler(BaseHTTPRequestHandler):

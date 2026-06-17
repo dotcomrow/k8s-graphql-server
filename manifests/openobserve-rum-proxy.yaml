@@ -21,8 +21,8 @@ data:
     import urllib.request
     from collections import deque, defaultdict
     import ast
-from urllib.parse import urlparse, urlunparse
-from typing import Dict, Tuple
+    from urllib.parse import urlparse, urlunparse
+    from typing import Dict, Tuple
 
     REQUIRED_HEADERS = ("x-rum-timestamp", "x-rum-signature")
     RUM_PATH_CANONICAL_MAP = {
@@ -268,22 +268,22 @@ from typing import Dict, Tuple
             return values
 
 
-def _flatten_records(values: list) -> list[dict]:
-    records: list[dict] = []
-    for value in values:
-        if isinstance(value, tuple):
-            value = list(value)
-        if isinstance(value, dict):
-            records.append(value)
-            continue
-        if isinstance(value, (list, tuple)):
-            if not value:
-                raise ValueError("top-level array value is empty")
-            for nested in value:
-                nested_records = _flatten_records([nested])
-                records.extend(nested_records)
-            continue
-        raise TypeError(f"top-level JSON value must be an object or array, got {type(value).__name__}")
+    def _flatten_records(values: list) -> list[dict]:
+        records: list[dict] = []
+        for value in values:
+            if isinstance(value, tuple):
+                value = list(value)
+            if isinstance(value, dict):
+                records.append(value)
+                continue
+            if isinstance(value, (list, tuple)):
+                if not value:
+                    raise ValueError("top-level array value is empty")
+                for nested in value:
+                    nested_records = _flatten_records([nested])
+                    records.extend(nested_records)
+                continue
+            raise TypeError(f"top-level JSON value must be an object or array, got {type(value).__name__}")
         return records
 
 

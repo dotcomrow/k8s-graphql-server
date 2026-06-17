@@ -20,8 +20,9 @@ data:
     import urllib.error
     import urllib.request
     from collections import deque, defaultdict
-    from urllib.parse import urlparse, urlunparse
-    from typing import Dict, Tuple
+    import ast
+from urllib.parse import urlparse, urlunparse
+from typing import Dict, Tuple
 
     REQUIRED_HEADERS = ("x-rum-timestamp", "x-rum-signature")
     RUM_PATH_CANONICAL_MAP = {
@@ -211,53 +212,78 @@ data:
 
 
     def _decode_json_values(decoded_body: str) -> list:
+        if not decoded_body:
+            return []
         decoder = json.JSONDecoder()
         values = []
         index = 0
         length = len(decoded_body)
 
-        while index < length:
-            while index < length and decoded_body[index].isspace():
-                index += 1
-            if index >= length:
-                break
-            value, index = decoder.raw_decode(decoded_body, index)
-            if isinstance(value, tuple):
-                value = list(value)
-            if not isinstance(value, (dict, list)):
-                raise TypeError("top-level JSON value must be an object or array")
-            if not value:
-                raise ValueError("top-level JSON object/array is empty")
-            values.append(value)
-
-            while index < length and decoded_body[index].isspace():
-                index += 1
-            if index < length and decoded_body[index] == ",":
-                index += 1
-            while index < length and decoded_body[index].isspace():
-                index += 1
-
-        return values
-
-
-    def _flatten_records(values: list) -> list[dict]:
-        records: list[dict] = []
-        for value in values:
-            if isinstance(value, dict):
-                records.append(value)
-                continue
-            if isinstance(value, list):
+        try:
+            while index < length:
+                while index < length and decoded_body[index].isspace():
+                    index += 1
+                if index >= length:
+                    break
+                value, index = decoder.raw_decode(decoded_body, index)
+                if isinstance(value, tuple):
+                    value = list(value)
+                if not isinstance(value, (dict, list, tuple)):
+                    raise TypeError("top-level JSON value must be an object or array")
                 if not value:
-                    raise ValueError("top-level array value is empty")
-                for nested in value:
-                    if isinstance(nested, dict):
-                        records.append(nested)
-                    elif isinstance(nested, list):
-                        records.extend(_flatten_records([nested]))
-                    else:
-                        raise TypeError(f"array item must be an object, got {type(nested).__name__}")
-                continue
-            raise TypeError(f"top-level JSON value must be object or array, got {type(value).__name__}")
+                    raise ValueError("top-level JSON object/array is empty")
+                values.append(value)
+
+                while index < length and decoded_body[index].isspace():
+                    index += 1
+                if index < length and decoded_body[index] == ",":
+                    index += 1
+                while index < length and decoded_body[index].isspace():
+                    index += 1
+            return values
+        except json.JSONDecodeError as exc:
+            # Fallback for non-strict or Python-literal payload fragments (e.g. line-based exports).
+            values = []
+            for raw_line in decoded_body.splitlines():
+                line = raw_line.strip().rstrip(",").rstrip(";").strip()
+                if not line:
+                    continue
+                parsed = None
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError:
+                    try:
+                        parsed = ast.literal_eval(line)
+                    except (SyntaxError, ValueError):
+                        raise exc
+                if isinstance(parsed, tuple):
+                    parsed = list(parsed)
+                if isinstance(parsed, (list, tuple)):
+                    values.extend(_flatten_records([parsed] if isinstance(parsed, tuple) else parsed))
+                    continue
+                if isinstance(parsed, dict):
+                    values.append(parsed)
+                    continue
+                raise TypeError("top-level JSON value must be an object or array")
+            return values
+
+
+def _flatten_records(values: list) -> list[dict]:
+    records: list[dict] = []
+    for value in values:
+        if isinstance(value, tuple):
+            value = list(value)
+        if isinstance(value, dict):
+            records.append(value)
+            continue
+        if isinstance(value, (list, tuple)):
+            if not value:
+                raise ValueError("top-level array value is empty")
+            for nested in value:
+                nested_records = _flatten_records([nested])
+                records.extend(nested_records)
+            continue
+        raise TypeError(f"top-level JSON value must be an object or array, got {type(value).__name__}")
         return records
 
 
@@ -275,7 +301,7 @@ data:
 
         try:
             values = _decode_json_values(decoded)
-        except (TypeError, json.JSONDecodeError) as exc:
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
             return False, b"", "application/json", f"payload is not valid JSON ({exc})"
         if not values:
             return False, b"", "application/json", "payload has no JSON values"

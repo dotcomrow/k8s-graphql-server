@@ -548,6 +548,7 @@ metadata:
   name: openobserve-rum-proxy
   namespace: openobserve
   annotations:
+    reloader.stakater.com/auto: "true"
     argocd.argoproj.io/sync-wave: "4"
 spec:
   replicas: 2
@@ -559,6 +560,7 @@ spec:
       labels:
         app: openobserve-rum-proxy
       annotations:
+        reloader.stakater.com/auto: "true"
         # Keep this proxy out of the service mesh unless you intentionally need it there.
         linkerd.io/inject: "disabled"
     spec:

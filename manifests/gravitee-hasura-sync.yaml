@@ -459,6 +459,7 @@ data:
                         "forward_client_headers": True,
                         "arguments": [{"name": "input", "type": "json"}],
                         "output_type": "json",
+                        "timeout": ACTION_TIMEOUT_SECONDS,
                     },
                     "permissions": [{"role": role} for role in action_roles],
                     "comment": f"{MANAGED_COMMENT} api={api_id} method={method_lower} path={path}",

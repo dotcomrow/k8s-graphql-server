@@ -58,7 +58,7 @@ data:
     )
     SYNC_INTERVAL = int(os.environ.get("SYNC_INTERVAL", "300"))
     JWT_CLOCK_SKEW_SECONDS = int(os.environ.get("JWT_CLOCK_SKEW_SECONDS", "60"))
-    ACTION_TIMEOUT_SECONDS = int(os.environ.get("ACTION_TIMEOUT_SECONDS", "30"))
+    ACTION_TIMEOUT_SECONDS = int(os.environ.get("ACTION_TIMEOUT_SECONDS", "120"))
     REMOTE_SCHEMA_TIMEOUT_SECONDS = int(os.environ.get("REMOTE_SCHEMA_TIMEOUT_SECONDS", "60"))
     INSECURE_SKIP_VERIFY = os.environ.get("INSECURE_SKIP_VERIFY", "false").lower() in ("1", "true", "yes")
 
@@ -1605,7 +1605,7 @@ spec:
             - name: JWT_CLOCK_SKEW_SECONDS
               value: "60"
             - name: ACTION_TIMEOUT_SECONDS
-              value: "30"
+              value: "120"
             - name: REMOTE_SCHEMA_TIMEOUT_SECONDS
               value: "60"
             - name: INTERNAL_JWK_URL

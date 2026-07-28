@@ -419,6 +419,7 @@ spec:
               path "secret/data/gravitee/admin-credentials" { capabilities = ["read"] }
               path "secret/data/gravitee-webhook-secret" { capabilities = ["read"] }
               path "secret/data/keycloak-client-id-graphql-api" { capabilities = ["read"] }
+              path "secret/data/platform-deploy-service/auth" { capabilities = ["read"] }
               EOF
 
               vault write auth/${AUTH_PATH}/role/graphql-gravitee-sync \

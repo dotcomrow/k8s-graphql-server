@@ -56,14 +56,6 @@ data:
         "ACTION_HANDLER_URL",
         "http://graphql-gravitee-sync.graphql.svc.cluster.local:8080/action",
     )
-    PLATFORM_DEPLOY_ACTION_PREFIX = os.environ.get(
-        "PLATFORM_DEPLOY_ACTION_PREFIX",
-        "gravitee_platform_deploy_api_",
-    )
-    PLATFORM_DEPLOY_SERVICE_TOKEN_PATH = os.environ.get(
-        "PLATFORM_DEPLOY_SERVICE_TOKEN_PATH",
-        "/vault/secrets/platform-deploy-service-auth-token",
-    )
     SYNC_INTERVAL = int(os.environ.get("SYNC_INTERVAL", "300"))
     JWT_CLOCK_SKEW_SECONDS = int(os.environ.get("JWT_CLOCK_SKEW_SECONDS", "60"))
     ACTION_TIMEOUT_SECONDS = int(os.environ.get("ACTION_TIMEOUT_SECONDS", "120"))
@@ -1039,12 +1031,7 @@ data:
             url = f"{url}?{urllib.parse.urlencode(query, doseq=True)}"
         headers = {"Accept": "application/json"}
         headers.update(extract_headers(input_data))
-        if str(action_name).startswith(PLATFORM_DEPLOY_ACTION_PREFIX):
-            service_token = read_file(PLATFORM_DEPLOY_SERVICE_TOKEN_PATH)
-            if not service_token:
-                raise ValueError("platform deploy service token is unavailable")
-            headers["Authorization"] = f"Bearer {service_token}"
-        elif auth_header:
+        if auth_header:
             headers["Authorization"] = auth_header
         body = extract_body(input_data)
         data = None
@@ -1537,7 +1524,7 @@ spec:
       labels:
         app: graphql-gravitee-sync
       annotations:
-        platform.suncoast.systems/restart-revision: "2026-07-28-platform-deploy-service-token"
+        platform.suncoast.systems/restart-revision: "2026-07-28-platform-deploy-gravitee-auth"
         reloader.stakater.com/auto: "true"
         vault.hashicorp.com/agent-inject: "true"
         vault.hashicorp.com/role: "graphql-gravitee-sync"
@@ -1569,11 +1556,6 @@ spec:
         vault.hashicorp.com/agent-inject-template-graphql-api-client-id: |
           {{- with secret "secret/data/keycloak-client-id-graphql-api" -}}
           {{ .Data.data.value }}
-          {{- end }}
-        vault.hashicorp.com/agent-inject-secret-platform-deploy-service-auth-token: "secret/data/platform-deploy-service/auth"
-        vault.hashicorp.com/agent-inject-template-platform-deploy-service-auth-token: |
-          {{- with secret "secret/data/platform-deploy-service/auth" -}}
-          {{ .Data.data.token }}
           {{- end }}
         linkerd.io/inject: "enabled"
     spec:
@@ -1620,10 +1602,6 @@ spec:
               value: "true"
             - name: ACTION_HANDLER_URL
               value: "http://graphql-gravitee-sync.graphql.svc.cluster.local:8080/action"
-            - name: PLATFORM_DEPLOY_ACTION_PREFIX
-              value: "gravitee_platform_deploy_api_"
-            - name: PLATFORM_DEPLOY_SERVICE_TOKEN_PATH
-              value: "/vault/secrets/platform-deploy-service-auth-token"
             - name: SYNC_INTERVAL
               value: "60"
             - name: JWT_CLOCK_SKEW_SECONDS

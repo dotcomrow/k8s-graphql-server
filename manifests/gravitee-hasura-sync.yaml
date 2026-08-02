@@ -280,47 +280,78 @@ data:
             "user_issuer": claims.get("iss"),
         }
 
-    def list_apis():
-        paths = [
-            f"/v2/organizations/{GRAVITEE_ORG}/environments/{GRAVITEE_ENV}/apis?size=1000",
-            f"/organizations/{GRAVITEE_ORG}/environments/{GRAVITEE_ENV}/apis?size=1000",
-        ]
-        for path in paths:
-            try:
-                body = gravitee_request("GET", path)
-                data = json.loads(body.decode("utf-8") or "[]")
-                if isinstance(data, dict) and "data" in data:
-                    return data.get("data") or []
-                if isinstance(data, dict) and "items" in data:
-                    return data.get("items") or []
-                if isinstance(data, list):
-                    return data
-            except urllib.error.HTTPError as exc:
-                if exc.code in (404, 405):
-                    continue
-                raise
+    def list_items_from_payload(data):
+        if isinstance(data, dict) and "data" in data:
+            return data.get("data") or []
+        if isinstance(data, dict) and "items" in data:
+            return data.get("items") or []
+        if isinstance(data, list):
+            return data
         return []
 
-    def list_pages(api_id):
-        paths = [
-            f"/v2/organizations/{GRAVITEE_ORG}/environments/{GRAVITEE_ENV}/apis/{api_id}/pages?size=200",
-            f"/organizations/{GRAVITEE_ORG}/environments/{GRAVITEE_ENV}/apis/{api_id}/pages",
-        ]
-        for path in paths:
-            try:
-                body = gravitee_request("GET", path)
-                data = json.loads(body.decode("utf-8") or "[]")
-                if isinstance(data, dict) and "data" in data:
-                    return data.get("data") or []
-                if isinstance(data, dict) and "items" in data:
-                    return data.get("items") or []
+    def int_or_zero(value):
+        try:
+            return int(value)
+        except Exception:
+            return 0
+
+    def with_pagination(path, page, size):
+        separator = "&" if "?" in path else "?"
+        return f"{path}{separator}{urllib.parse.urlencode({'page': page, 'size': size})}"
+
+    def list_paginated(paths, size=1000):
+        for base_path in paths:
+            collected = []
+            seen = set()
+            page = 1
+            while True:
+                try:
+                    body = gravitee_request("GET", with_pagination(base_path, page, size))
+                    data = json.loads(body.decode("utf-8") or "[]")
+                except urllib.error.HTTPError as exc:
+                    if exc.code in (404, 405):
+                        collected = []
+                        break
+                    raise
+                items = list_items_from_payload(data)
+                for item in items:
+                    key = None
+                    if isinstance(item, dict):
+                        key = item.get("id") or item.get("_id") or item.get("name")
+                    if not key:
+                        key = json.dumps(item, sort_keys=True, default=str)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    collected.append(item)
                 if isinstance(data, list):
-                    return data
-            except urllib.error.HTTPError as exc:
-                if exc.code in (404, 405):
-                    continue
-                raise
+                    return collected
+                pagination = data.get("pagination") if isinstance(data, dict) else {}
+                links = data.get("links") if isinstance(data, dict) else {}
+                page_count = int_or_zero((pagination or {}).get("pageCount") or (pagination or {}).get("page_count"))
+                if page_count:
+                    if page >= page_count:
+                        return collected
+                elif not (links or {}).get("next") or not items:
+                    return collected
+                page += 1
+                if page > 100:
+                    raise RuntimeError(f"Gravitee pagination exceeded 100 pages for {base_path}")
+            if collected:
+                return collected
         return []
+
+    def list_apis():
+        return list_paginated([
+            f"/v2/organizations/{GRAVITEE_ORG}/environments/{GRAVITEE_ENV}/apis",
+            f"/organizations/{GRAVITEE_ORG}/environments/{GRAVITEE_ENV}/apis",
+        ])
+
+    def list_pages(api_id):
+        return list_paginated([
+            f"/v2/organizations/{GRAVITEE_ORG}/environments/{GRAVITEE_ENV}/apis/{api_id}/pages",
+            f"/organizations/{GRAVITEE_ORG}/environments/{GRAVITEE_ENV}/apis/{api_id}/pages",
+        ], size=200)
 
     def extract_context_path(api):
         for key in ("contextPath", "context_path"):

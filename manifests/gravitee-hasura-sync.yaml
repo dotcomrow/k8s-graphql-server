@@ -155,8 +155,13 @@ data:
             "X-Hasura-Admin-Secret": admin_secret,
         }
         req = urllib.request.Request(f"{HASURA_URL}/v1/metadata", data=body, headers=headers, method="POST")
-        with urlopen(req, timeout=30) as resp:
-            raw = resp.read().decode("utf-8")
+        try:
+            with urlopen(req, timeout=30) as resp:
+                raw = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            log(f"Hasura metadata request failed: status={exc.code} body={raw[:2000]}")
+            raise
         return json.loads(raw) if raw else {}
 
     def parse_label_map(api):
@@ -325,15 +330,21 @@ data:
                     seen.add(key)
                     collected.append(item)
                 if isinstance(data, list):
-                    return collected
+                    if collected:
+                        return collected
+                    break
                 pagination = data.get("pagination") if isinstance(data, dict) else {}
                 links = data.get("links") if isinstance(data, dict) else {}
                 page_count = int_or_zero((pagination or {}).get("pageCount") or (pagination or {}).get("page_count"))
                 if page_count:
                     if page >= page_count:
-                        return collected
+                        if collected:
+                            return collected
+                        break
                 elif not (links or {}).get("next") or not items:
-                    return collected
+                    if collected:
+                        return collected
+                    break
                 page += 1
                 if page > 100:
                     raise RuntimeError(f"Gravitee pagination exceeded 100 pages for {base_path}")
@@ -722,11 +733,22 @@ data:
                     api_name = api.get("name") or api.get("id") or "api"
                     log(f"Skipping {api_name}: hasura.mode=openapi but no OpenAPI spec found")
                     continue
-                remotes.append(build_remote_schema(api, endpoint, existing_names))
+                api_name = api.get("name") or api.get("id") or "api"
+                log(
+                    f"Skipping {api_name}: no OpenAPI spec found; "
+                    f"set {MODE_LABEL_KEY}=graphql to register a remote schema"
+                )
 
             if not actions and not remotes:
                 log("No Gravitee APIs matched for sync")
                 return
+
+            finalized_async_policy_map = finalize_async_policy_map(async_policy_map)
+            with ACTION_LOCK:
+                ACTION_MAP.clear()
+                ACTION_MAP.update(action_mapping)
+                ASYNC_POLICY_MAP.clear()
+                ASYNC_POLICY_MAP.update(finalized_async_policy_map)
 
             current = hasura_request({"type": "export_metadata", "args": {}})
             merged = merge_metadata(current, actions, remotes)
@@ -734,22 +756,17 @@ data:
             if metadata_changed:
                 hasura_request({"type": "replace_metadata", "args": merged})
 
-            with ACTION_LOCK:
-                ACTION_MAP.clear()
-                ACTION_MAP.update(action_mapping)
-                ASYNC_POLICY_MAP.clear()
-                ASYNC_POLICY_MAP.update(finalize_async_policy_map(async_policy_map))
             if metadata_changed:
                 log(
                     "Sync complete: "
                     + f"actions={len(actions)} remote_schemas={len(remotes)} "
-                    + f"async_policies={len(ASYNC_POLICY_MAP)}"
+                    + f"async_policies={len(finalized_async_policy_map)}"
                 )
             else:
                 log(
                     "Sync complete: "
                     + f"actions={len(actions)} remote_schemas={len(remotes)} "
-                    + f"async_policies={len(ASYNC_POLICY_MAP)} "
+                    + f"async_policies={len(finalized_async_policy_map)} "
                     + "(no metadata changes)"
                 )
         except Exception as exc:

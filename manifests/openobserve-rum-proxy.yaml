@@ -117,7 +117,7 @@ data:
     LISTEN_HOST = _env("APP_LISTEN_HOST", "0.0.0.0")
     LISTEN_PORT = int(_env("APP_LISTEN_PORT", "8080"))
     UPSTREAM_BASE = _env("OPENOBSERVE_UPSTREAM_BASE", "http://openobserve-router.openobserve.svc.cluster.local:5080")
-    UPSTREAM_PATH = _env("OPENOBSERVE_RUM_PATH", "/api/default/rum")
+    UPSTREAM_PATH = _env("OPENOBSERVE_RUM_PATH", "/api/default/_rumdata/_json")
     UPSTREAM_LOGS_PATH = _env("OPENOBSERVE_LOGS_PATH", "/api/default/logs")
     ALLOWED_ORIGINS = [
         value.strip().lower()
@@ -327,6 +327,92 @@ data:
         return {str(key): _coerce_scalar(value) for key, value in record.items()}
 
 
+    def _safe_key(value) -> str:
+        return str(value).strip().replace(".", "_").replace("-", "_").replace(" ", "_")
+
+
+    def _parse_ootags(value) -> dict:
+        tags = {}
+        if isinstance(value, str):
+            parts = value.split(",")
+        elif isinstance(value, (list, tuple)):
+            parts = value
+        elif isinstance(value, dict):
+            return {_safe_key(k): _coerce_scalar(v) for k, v in value.items()}
+        else:
+            return tags
+
+        for item in parts:
+            if not isinstance(item, str) or ":" not in item:
+                continue
+            key, val = item.split(":", 1)
+            key = _safe_key(key)
+            if key:
+                tags[key] = val.strip()
+        return tags
+
+
+    def _flatten_nested(prefix: str, value, record: dict) -> None:
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                child = f"{prefix}_{_safe_key(key)}" if prefix else _safe_key(key)
+                _flatten_nested(child, nested, record)
+            return
+        if isinstance(value, (list, tuple)):
+            if prefix:
+                record[prefix] = json.dumps(value, separators=(",", ":"))
+            return
+        if prefix:
+            record[prefix] = value
+
+
+    def _normalize_rum_record(record: dict) -> dict:
+        if not isinstance(record, dict):
+            return {"value": _coerce_scalar(record)}
+
+        normalized = {}
+        for key, value in record.items():
+            _flatten_nested(_safe_key(key), value, normalized)
+
+        normalized["_oo"] = json.dumps(record, separators=(",", ":"))
+
+        for key, value in _parse_ootags(record.get("ootags")).items():
+            normalized.setdefault(key, value)
+
+        if "session_has_replay" not in normalized:
+            if "session_sampled_for_replay" in normalized:
+                normalized["session_has_replay"] = normalized["session_sampled_for_replay"]
+            elif "session_id" in normalized:
+                normalized["session_has_replay"] = False
+
+        if "source" not in normalized:
+            normalized["source"] = "browser"
+
+        if "date" in normalized and "_timestamp" not in normalized:
+            try:
+                event_ts = int(float(normalized["date"]))
+                normalized["_timestamp"] = event_ts if event_ts > 100000000000000 else event_ts * 1000
+            except (TypeError, ValueError):
+                pass
+
+        return _coerce_record(normalized)
+
+
+    def _flatten_rum_records(values: list) -> list[dict]:
+        records: list[dict] = []
+        for value in values:
+            if isinstance(value, dict):
+                records.append(_normalize_rum_record(value))
+                continue
+            if isinstance(value, (list, tuple)):
+                if not value:
+                    raise ValueError("top-level array value is empty")
+                records.extend(_flatten_rum_records(list(value)))
+                continue
+            raise TypeError(f"top-level JSON value must be an object or array, got {type(value).__name__}")
+        return records
+
+
     def _flatten_records(values: list) -> list[dict]:
         records: list[dict] = []
         for value in values:
@@ -346,7 +432,7 @@ data:
         return records
 
 
-    def _normalize_payload(body: bytes, content_type: str) -> Tuple[bool, bytes, str, str]:
+    def _normalize_payload(body: bytes, content_type: str, canonical_path: str = "") -> Tuple[bool, bytes, str, str]:
         if not body:
             return False, b"", "application/json", "empty payload"
 
@@ -366,7 +452,10 @@ data:
             return False, b"", "application/json", "payload has no JSON values"
 
         try:
-            records = _flatten_records(values)
+            if canonical_path == "/v1/rum":
+                records = _flatten_rum_records(values)
+            else:
+                records = _flatten_records(values)
         except (TypeError, ValueError) as exc:
             return False, b"", "application/json", f"payload shape invalid ({exc})"
 
@@ -508,6 +597,7 @@ data:
                 valid_payload, normalized_body, normalized_content_type, payload_error = _normalize_payload(
                     body,
                     self.headers.get("Content-Type", ""),
+                    canonical_path,
                 )
             if not valid_payload:
                 return False, json.dumps({"error":"invalid payload", "detail": payload_error}).encode(), "application/json"
@@ -649,7 +739,7 @@ spec:
             - name: OPENOBSERVE_UPSTREAM_BASE
               value: "http://openobserve-router.openobserve.svc.cluster.local:5080"
             - name: OPENOBSERVE_RUM_PATH
-              value: "/api/default/rum/_json"
+              value: "/api/default/_rumdata/_json"
             - name: OPENOBSERVE_LOGS_PATH
               value: "/api/default/logs/_json"
             - name: OPENOBSERVE_MAX_PAYLOAD_BYTES

@@ -25,6 +25,8 @@ data:
     from typing import Dict, Tuple
 
     REQUIRED_HEADERS = ("x-rum-timestamp", "x-rum-signature")
+    RUM_NATIVE_TRACK_TYPES = {"rum", "logs", "replay", "profile"}
+    RUM_RAW_NATIVE_TRACK_TYPES = {"replay", "profile"}
     RUM_PATH_CANONICAL_MAP = {
       "/v1/rum": [
         "/v1/rum",
@@ -62,8 +64,36 @@ data:
     def _normalize_path(value: str) -> str:
         return (value or "/").split("?", 1)[0].rstrip("/") or "/"
 
+    def _parse_native_rum_path(path: str) -> Tuple[str, str, str]:
+        normalized_path = _normalize_path(urlparse(path).path)
+        parts = normalized_path.strip("/").split("/")
+        if (
+            len(parts) == 4
+            and parts[0] == "rum"
+            and parts[1].startswith("v")
+            and parts[2]
+            and parts[3] in RUM_NATIVE_TRACK_TYPES
+        ):
+            return normalized_path, parts[2], parts[3]
+        return "", "", ""
+
+    def _native_track_type(path: str) -> str:
+        _, _, track_type = _parse_native_rum_path(path)
+        return track_type
+
+    def _is_raw_native_path(path: str) -> bool:
+        return _native_track_type(path) in RUM_RAW_NATIVE_TRACK_TYPES
+
     def _canonical_path(path: str) -> str:
         normalized_path = _normalize_path(path)
+        native_path, _, track_type = _parse_native_rum_path(normalized_path)
+        if native_path:
+            if track_type == "rum":
+                return "/v1/rum"
+            if track_type == "logs":
+                return "/v1/logs"
+            if track_type in RUM_RAW_NATIVE_TRACK_TYPES:
+                return native_path
         for canonical, aliases in RUM_PATH_CANONICAL_MAP.items():
             if normalized_path in aliases:
                 return canonical
@@ -206,9 +236,24 @@ data:
 
 
     def _upstream_path(path: str) -> str:
+        if _is_raw_native_path(path):
+            return path
         if path == "/v1/logs":
             return UPSTREAM_LOGS_PATH
         return UPSTREAM_PATH
+
+
+    def _upstream_target(path: str, canonical_path: str) -> str:
+        parsed_base = urlparse(UPSTREAM_BASE)
+        parsed_request = urlparse(path)
+        return urlunparse(
+            parsed_base._replace(
+                path=_upstream_path(canonical_path),
+                params="",
+                query=parsed_request.query,
+                fragment="",
+            )
+        )
 
 
     def _decode_json_values(decoded_body: str) -> list:
@@ -334,6 +379,19 @@ data:
         return True, normalized_body, normalized_content_type, ""
 
 
+    def _normalize_raw_native_payload(body: bytes, content_type: str, path: str) -> Tuple[bool, bytes, str, str]:
+        if not body:
+            return False, b"", "application/json", "empty payload"
+
+        content_type = (content_type or "").strip()
+        normalized_content_type = content_type.split(";", 1)[0].strip().lower()
+        track_type = _native_track_type(path)
+        if track_type in RUM_RAW_NATIVE_TRACK_TYPES and normalized_content_type != "multipart/form-data":
+            return False, b"", "application/json", f"unsupported content type '{normalized_content_type}'"
+
+        return True, body, content_type or "application/octet-stream", ""
+
+
     def _rewrap_batch(body: bytes) -> bytes:
         if not body:
             return body
@@ -396,7 +454,11 @@ data:
             raise error
 
     def _forward(body: bytes, headers: Dict[str, str], path: str, content_type: str) -> Tuple[int, bytes, Dict[str, str]]:
-        target = urlunparse(urlparse(UPSTREAM_BASE)._replace(path=_upstream_path(_canonical_path(path))))
+        canonical_path = _canonical_path(path)
+        target = _upstream_target(path, canonical_path)
+        if _is_raw_native_path(canonical_path):
+            return _send_to_upstream(target, body, headers, content_type)
+
         normalized_body = _rewrap_batch(body)
         status, upstream_body, upstream_headers = _send_to_upstream(target, normalized_body, headers, content_type)
         if status == 400 and _is_trailing_error(upstream_body):
@@ -436,10 +498,17 @@ data:
             if content_length > MAX_PAYLOAD_BYTES:
                 return False, b'{"error":"payload too large"}', "application/json"
             body = self.rfile.read(content_length) if content_length > 0 else b""
-            valid_payload, normalized_body, normalized_content_type, payload_error = _normalize_payload(
-                body,
-                self.headers.get("Content-Type", ""),
-            )
+            if _is_raw_native_path(canonical_path):
+                valid_payload, normalized_body, normalized_content_type, payload_error = _normalize_raw_native_payload(
+                    body,
+                    self.headers.get("Content-Type", ""),
+                    canonical_path,
+                )
+            else:
+                valid_payload, normalized_body, normalized_content_type, payload_error = _normalize_payload(
+                    body,
+                    self.headers.get("Content-Type", ""),
+                )
             if not valid_payload:
                 return False, json.dumps({"error":"invalid payload", "detail": payload_error}).encode(), "application/json"
             if _is_rate_limited(canonical_path, self._client_ip()):
@@ -584,7 +653,7 @@ spec:
             - name: OPENOBSERVE_LOGS_PATH
               value: "/api/default/logs/_json"
             - name: OPENOBSERVE_MAX_PAYLOAD_BYTES
-              value: "262144"
+              value: "4194304"
             - name: RUM_RATE_LIMIT_WINDOW_SECONDS
               value: "60"
             - name: RUM_RATE_LIMIT_MAX_REQUESTS

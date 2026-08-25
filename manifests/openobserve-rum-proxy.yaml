@@ -26,7 +26,8 @@ data:
 
     REQUIRED_HEADERS = ("x-rum-timestamp", "x-rum-signature")
     RUM_NATIVE_TRACK_TYPES = {"rum", "logs", "replay", "profile"}
-    RUM_RAW_NATIVE_TRACK_TYPES = {"replay", "profile"}
+    RUM_DIRECT_NATIVE_TRACK_TYPES = {"logs", "replay", "profile"}
+    RUM_MULTIPART_NATIVE_TRACK_TYPES = {"replay", "profile"}
     RUM_PATH_CANONICAL_MAP = {
       "/v1/rum": [
         "/v1/rum",
@@ -81,8 +82,11 @@ data:
         _, _, track_type = _parse_native_rum_path(path)
         return track_type
 
-    def _is_raw_native_path(path: str) -> bool:
-        return _native_track_type(path) in RUM_RAW_NATIVE_TRACK_TYPES
+    def _is_direct_native_path(path: str) -> bool:
+        return _native_track_type(path) in RUM_DIRECT_NATIVE_TRACK_TYPES
+
+    def _is_multipart_native_path(path: str) -> bool:
+        return _native_track_type(path) in RUM_MULTIPART_NATIVE_TRACK_TYPES
 
     def _canonical_path(path: str) -> str:
         normalized_path = _normalize_path(path)
@@ -90,10 +94,10 @@ data:
         if native_path:
             if track_type == "rum":
                 return "/v1/rum"
+            if track_type in RUM_DIRECT_NATIVE_TRACK_TYPES:
+                return native_path
             if track_type == "logs":
                 return "/v1/logs"
-            if track_type in RUM_RAW_NATIVE_TRACK_TYPES:
-                return native_path
         for canonical, aliases in RUM_PATH_CANONICAL_MAP.items():
             if normalized_path in aliases:
                 return canonical
@@ -236,7 +240,7 @@ data:
 
 
     def _upstream_path(path: str) -> str:
-        if _is_raw_native_path(path):
+        if _is_direct_native_path(path):
             return path
         if path == "/v1/logs":
             return UPSTREAM_LOGS_PATH
@@ -474,8 +478,7 @@ data:
 
         content_type = (content_type or "").strip()
         normalized_content_type = content_type.split(";", 1)[0].strip().lower()
-        track_type = _native_track_type(path)
-        if track_type in RUM_RAW_NATIVE_TRACK_TYPES and normalized_content_type != "multipart/form-data":
+        if _is_multipart_native_path(path) and normalized_content_type != "multipart/form-data":
             return False, b"", "application/json", f"unsupported content type '{normalized_content_type}'"
 
         return True, body, content_type or "application/octet-stream", ""
@@ -545,7 +548,7 @@ data:
     def _forward(body: bytes, headers: Dict[str, str], path: str, content_type: str) -> Tuple[int, bytes, Dict[str, str]]:
         canonical_path = _canonical_path(path)
         target = _upstream_target(path, canonical_path)
-        if _is_raw_native_path(canonical_path):
+        if _is_direct_native_path(canonical_path):
             return _send_to_upstream(target, body, headers, content_type)
 
         normalized_body = _rewrap_batch(body)
@@ -587,7 +590,7 @@ data:
             if content_length > MAX_PAYLOAD_BYTES:
                 return False, b'{"error":"payload too large"}', "application/json"
             body = self.rfile.read(content_length) if content_length > 0 else b""
-            if _is_raw_native_path(canonical_path):
+            if _is_direct_native_path(canonical_path):
                 valid_payload, normalized_body, normalized_content_type, payload_error = _normalize_raw_native_payload(
                     body,
                     self.headers.get("Content-Type", ""),

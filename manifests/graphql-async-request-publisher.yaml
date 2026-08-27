@@ -835,13 +835,6 @@ spec:
             - name: publisher-config
               mountPath: /opt/config
               readOnly: true
-          resources:
-            requests:
-              cpu: "100m"
-              memory: "256Mi"
-            limits:
-              cpu: "500m"
-              memory: "512Mi"
       volumes:
         - name: publisher-config
           configMap:

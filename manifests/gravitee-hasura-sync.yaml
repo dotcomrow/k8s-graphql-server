@@ -61,6 +61,8 @@ data:
     ACTION_TIMEOUT_SECONDS = int(os.environ.get("ACTION_TIMEOUT_SECONDS", "120"))
     REMOTE_SCHEMA_TIMEOUT_SECONDS = int(os.environ.get("REMOTE_SCHEMA_TIMEOUT_SECONDS", "60"))
     INSECURE_SKIP_VERIFY = os.environ.get("INSECURE_SKIP_VERIFY", "false").lower() in ("1", "true", "yes")
+    MAX_MANAGED_ACTION_DROP_RATIO = float(os.environ.get("HASURA_MAX_MANAGED_ACTION_DROP_RATIO", "0.25"))
+    MIN_MANAGED_ACTIONS_FOR_DROP_GUARD = int(os.environ.get("HASURA_MIN_MANAGED_ACTIONS_FOR_DROP_GUARD", "50"))
 
     INTERNAL_JWK_URL = os.environ.get(
         "INTERNAL_JWK_URL",
@@ -691,6 +693,46 @@ data:
         metadata["custom_types"] = custom_types
         return metadata
 
+    def managed_actions_from_metadata(metadata):
+        return [
+            action
+            for action in (metadata.get("actions") or [])
+            if MANAGED_COMMENT in str(action.get("comment", ""))
+        ]
+
+    def parse_managed_action_comment(comment):
+        parsed = {}
+        for match in re.finditer(r"([A-Za-z_]+)=([^ ]+)", str(comment or "")):
+            parsed[match.group(1)] = match.group(2)
+        return parsed
+
+    def mapping_from_metadata(metadata, api_endpoints):
+        mapping = {}
+        for action in managed_actions_from_metadata(metadata):
+            name = action.get("name")
+            comment = parse_managed_action_comment(action.get("comment", ""))
+            api_id = comment.get("api", "")
+            endpoint = api_endpoints.get(api_id, "")
+            method = comment.get("method", "")
+            path = comment.get("path", "")
+            if not (name and endpoint and method and path):
+                continue
+            mapping[name] = {
+                "method": method.upper(),
+                "path": path,
+                "base_url": endpoint.rstrip("/"),
+            }
+        return mapping
+
+    def unsafe_managed_action_drop(current, generated_count):
+        existing_count = len(managed_actions_from_metadata(current))
+        if existing_count < MIN_MANAGED_ACTIONS_FOR_DROP_GUARD:
+            return False, existing_count, 0.0
+        if generated_count >= existing_count:
+            return False, existing_count, 0.0
+        drop_ratio = (existing_count - generated_count) / existing_count
+        return drop_ratio > MAX_MANAGED_ACTION_DROP_RATIO, existing_count, drop_ratio
+
     def canonical_json(value):
         return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
@@ -703,6 +745,7 @@ data:
             remotes = []
             action_mapping = {}
             async_policy_map = {}
+            api_endpoints = {}
             existing_names = set()
             for api in apis:
                 labels = parse_label_map(api)
@@ -716,6 +759,7 @@ data:
                     api_name = api.get("name") or api.get("id") or "api"
                     log(f"Skipping {api_name}: missing {ENDPOINT_LABEL_KEY} label or context path")
                     continue
+                api_endpoints[api_id] = endpoint
                 mode = labels.get(MODE_LABEL_KEY, "").lower()
                 if mode == "graphql":
                     remotes.append(build_remote_schema(api, endpoint, existing_names))
@@ -751,6 +795,24 @@ data:
                 ASYNC_POLICY_MAP.update(finalized_async_policy_map)
 
             current = hasura_request({"type": "export_metadata", "args": {}})
+            unsafe_drop, existing_action_count, drop_ratio = unsafe_managed_action_drop(current, len(actions))
+            if unsafe_drop:
+                preserved_mapping = mapping_from_metadata(current, api_endpoints)
+                with ACTION_LOCK:
+                    if preserved_mapping:
+                        ACTION_MAP.clear()
+                        ACTION_MAP.update(preserved_mapping)
+                    ASYNC_POLICY_MAP.clear()
+                    ASYNC_POLICY_MAP.update(finalized_async_policy_map)
+                log(
+                    "Skipping metadata replace: generated managed action count dropped "
+                    + f"from {existing_action_count} to {len(actions)} "
+                    + f"({drop_ratio:.1%}), above allowed "
+                    + f"{MAX_MANAGED_ACTION_DROP_RATIO:.1%}; "
+                    + f"preserved_action_mappings={len(preserved_mapping)}"
+                )
+                return
+
             merged = merge_metadata(current, actions, remotes)
             metadata_changed = canonical_json(merged) != canonical_json(current)
             if metadata_changed:

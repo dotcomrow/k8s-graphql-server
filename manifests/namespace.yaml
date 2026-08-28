@@ -6,5 +6,7 @@ metadata:
     app: graphql
   annotations:
     linkerd.io/inject: enabled
+    config.linkerd.io/proxy-cpu-request: "25m"
+    config.linkerd.io/proxy-memory-request: "64Mi"
     field.cattle.io/projectId: local:infrastructure
     vault.hashicorp.com/agent-injection: enabled

@@ -9,7 +9,6 @@ metadata:
 spec:
   activeDeadlineSeconds: 600
   backoffLimit: 0
-  ttlSecondsAfterFinished: 300
   template:
     metadata:
       labels:

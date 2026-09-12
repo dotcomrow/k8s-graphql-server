@@ -14,6 +14,8 @@ Env vars set directly on the container in `manifests/hasura.yaml` take precedenc
 `manifests/hasura-catalog-preflight.yaml` runs before the Hasura Deployment (Argo sync-wave ordering) and repairs a known partial-catalog state that causes Hasura startup to fail with:
 `Rows returned != 1` from `hdb_catalog.hdb_version`.
 
+The completed preflight Job is intentionally retained in the cluster. If Kubernetes TTL deletes it, ArgoCD treats the missing Job as drift and recreates it continuously.
+
 ### Regenerating The Config Template
 The template is generated from the exact `hasura/graphql-engine` image pinned in `manifests/hasura.yaml`:
 

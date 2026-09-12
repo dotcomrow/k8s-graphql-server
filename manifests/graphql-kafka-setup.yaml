@@ -164,6 +164,32 @@ spec:
                 "/opt/kafka/bin/${script}" --bootstrap-server "${KAFKA_ACTIVE_BOOTSTRAP}" "${CMD_CFG[@]}" "$@"
               }
 
+              is_retryable_kafka_error() {
+                grep -Eqi "DNS resolution failed|No resolvable bootstrap urls|Failed to create new KafkaAdminClient|TimeoutException|Timed out|NetworkException|DisconnectException" <<<"$1"
+              }
+
+              kafka_cli_retry() {
+                local script="$1"
+                shift
+                local output rc
+                while true; do
+                  if output="$(kafka_cli "${script}" "$@" 2>&1)"; then
+                    printf '%s\n' "${output}"
+                    return 0
+                  fi
+                  rc=$?
+
+                  if ! is_retryable_kafka_error "${output}" || (( $(date +%s) >= timeout_deadline )); then
+                    printf '%s\n' "${output}" >&2
+                    return "${rc}"
+                  fi
+
+                  echo "Kafka command ${script} hit a transient client/bootstrap error; retrying in ${KAFKA_RETRY_INTERVAL_SECONDS}s..." >&2
+                  printf '%s\n' "${output}" >&2
+                  sleep "${KAFKA_RETRY_INTERVAL_SECONDS}"
+                done
+              }
+
               AUTH_OUTPUT=""
               while true; do
                 if AUTH_OUTPUT="$(kafka_cli kafka-broker-api-versions.sh 2>&1)"; then
@@ -196,7 +222,7 @@ spec:
                   echo "Topic exists: ${topic}"
                 else
                   echo "Creating topic: ${topic}"
-                  kafka_cli kafka-topics.sh \
+                  kafka_cli_retry kafka-topics.sh \
                     --create \
                     --if-not-exists \
                     --topic "${topic}" \
@@ -204,13 +230,13 @@ spec:
                     --replication-factor "${KAFKA_REPLICATION_FACTOR}"
                 fi
 
-                kafka_cli kafka-configs.sh \
+                kafka_cli_retry kafka-configs.sh \
                   --alter \
                   --entity-type topics \
                   --entity-name "${topic}" \
                   --add-config "retention.ms=${retention_ms},segment.ms=${segment_ms},cleanup.policy=delete,min.insync.replicas=1"
 
-                kafka_cli kafka-topics.sh --describe --topic "${topic}"
+                kafka_cli_retry kafka-topics.sh --describe --topic "${topic}"
               }
 
               create_or_update_topic "${KAFKA_REQUEST_TOPIC}" "${KAFKA_REQUEST_PARTITIONS}" "${KAFKA_REQUEST_RETENTION_MS}" "${KAFKA_REQUEST_SEGMENT_MS}"
@@ -219,7 +245,7 @@ spec:
 
               echo "Ensuring SCRAM credentials for user ${KAFKA_ASYNC_USERNAME}"
               SCRAM_OUTPUT=""
-              if ! SCRAM_OUTPUT="$(kafka_cli kafka-configs.sh \
+              if ! SCRAM_OUTPUT="$(kafka_cli_retry kafka-configs.sh \
                 --alter \
                 --entity-type users \
                 --entity-name "${KAFKA_ASYNC_USERNAME}" \
@@ -238,7 +264,7 @@ spec:
                 --entity-name "${KAFKA_ASYNC_USERNAME}" >/dev/null 2>&1 || true
 
               ACL_LIST_OUTPUT=""
-              if ACL_LIST_OUTPUT="$(kafka_cli kafka-acls.sh --list 2>&1)"; then
+              if ACL_LIST_OUTPUT="$(kafka_cli_retry kafka-acls.sh --list 2>&1)"; then
                 ACLS_ENABLED="true"
               elif grep -q "SecurityDisabledException" <<<"${ACL_LIST_OUTPUT}"; then
                 ACLS_ENABLED="false"
@@ -254,7 +280,7 @@ spec:
 
               if [[ "${ACLS_ENABLED}" == "true" ]]; then
                 add_acl() {
-                  kafka_cli kafka-acls.sh \
+                  kafka_cli_retry kafka-acls.sh \
                     --add \
                     --allow-principal "User:${KAFKA_ASYNC_USERNAME}" \
                     "$@"
@@ -264,7 +290,7 @@ spec:
                 add_acl --topic "${KAFKA_RESPONSE_TOPIC}" --operation Read --operation Write --operation Describe
                 add_acl --topic "${KAFKA_DLQ_TOPIC}" --operation Read --operation Write --operation Describe
                 add_acl --group "${KAFKA_CONSUMER_GROUP}" --operation Read --operation Describe
-                kafka_cli kafka-acls.sh --list
+                kafka_cli_retry kafka-acls.sh --list
               fi
 
               echo "Kafka async setup complete"

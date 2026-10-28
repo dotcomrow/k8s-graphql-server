@@ -307,7 +307,7 @@ spec:
                   role: $role,
                   permission: {
                     columns: [
-                      "request_id", "client_id", "status", "request_payload", "response_payload",
+                      "id", "request_id", "client_id", "status", "request_payload", "response_payload",
                       "error_payload", "metadata",
                       "created_at", "updated_at", "completed_at", "expires_at", "operation_type",
                       "operation_version", "priority", "not_before",

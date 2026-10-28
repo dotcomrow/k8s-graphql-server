@@ -149,7 +149,9 @@ data:
         acks="all",
         retries=10,
         enable_idempotence=True,
-        max_in_flight_requests_per_connection=5,
+        # kafka-python requires a single in-flight request when idempotence is
+        # enabled so retries cannot reorder records.
+        max_in_flight_requests_per_connection=1,
         linger_ms=10,
         request_timeout_ms=30000,
       )

@@ -45,6 +45,10 @@ spec:
               value: "http://hasura.graphql.svc.cluster.local:8080"
             - name: ASYNC_REQUEST_ACTION_HANDLER_URL
               value: "http://graphql-async-request-publisher.graphql.svc.cluster.local:8080/action/publish_async_request"
+            - name: ASYNC_CANCEL_ACTION_HANDLER_URL
+              value: "http://graphql-async-request-publisher.graphql.svc.cluster.local:8080/action/cancel_async_operation"
+            - name: ASYNC_RETRY_ACTION_HANDLER_URL
+              value: "http://graphql-async-request-publisher.graphql.svc.cluster.local:8080/action/retry_async_operation"
             - name: ASYNC_CLIENT_ROLE
               value: "user"
             - name: ASYNC_SERVICE_ROLE
@@ -152,6 +156,40 @@ spec:
                 expires_at TIMESTAMPTZ
               );
 
+              ALTER TABLE graphql.client_async_messages
+                ADD COLUMN IF NOT EXISTS operation_type TEXT,
+                ADD COLUMN IF NOT EXISTS operation_version TEXT,
+                ADD COLUMN IF NOT EXISTS handler TEXT,
+                ADD COLUMN IF NOT EXISTS operation TEXT,
+                ADD COLUMN IF NOT EXISTS priority TEXT NOT NULL DEFAULT 'normal',
+                ADD COLUMN IF NOT EXISTS not_before TIMESTAMPTZ,
+                ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0,
+                ADD COLUMN IF NOT EXISTS max_attempts INTEGER NOT NULL DEFAULT 1,
+                ADD COLUMN IF NOT EXISTS cancel_requested_at TIMESTAMPTZ,
+                ADD COLUMN IF NOT EXISTS leased_at TIMESTAMPTZ,
+                ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ,
+                ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ;
+
+              CREATE TABLE IF NOT EXISTS graphql.async_operation_outbox (
+                id BIGSERIAL PRIMARY KEY,
+                request_id TEXT NOT NULL REFERENCES graphql.client_async_messages(request_id) ON DELETE CASCADE,
+                event_type TEXT NOT NULL DEFAULT 'operation.requested',
+                kafka_topic TEXT NOT NULL,
+                message_key TEXT NOT NULL,
+                payload JSONB NOT NULL,
+                available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                publish_attempts INTEGER NOT NULL DEFAULT 0,
+                max_publish_attempts INTEGER NOT NULL DEFAULT 20,
+                locked_at TIMESTAMPTZ,
+                locked_by TEXT,
+                published_at TIMESTAMPTZ,
+                kafka_partition INTEGER,
+                kafka_offset BIGINT,
+                last_error TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+              );
+
               CREATE INDEX IF NOT EXISTS client_async_messages_client_status_created_idx
                 ON graphql.client_async_messages (client_id, status, created_at DESC);
               CREATE INDEX IF NOT EXISTS client_async_messages_status_created_idx
@@ -160,6 +198,13 @@ spec:
                 ON graphql.client_async_messages (request_id);
               CREATE INDEX IF NOT EXISTS client_async_messages_expires_at_idx
                 ON graphql.client_async_messages (expires_at);
+              CREATE INDEX IF NOT EXISTS client_async_messages_handler_status_idx
+                ON graphql.client_async_messages (handler, status, priority, created_at);
+              CREATE INDEX IF NOT EXISTS async_operation_outbox_ready_idx
+                ON graphql.async_operation_outbox (available_at, id)
+                WHERE published_at IS NULL;
+              CREATE INDEX IF NOT EXISTS async_operation_outbox_request_idx
+                ON graphql.async_operation_outbox (request_id, id DESC);
 
               CREATE OR REPLACE FUNCTION graphql.set_updated_at()
               RETURNS trigger
@@ -177,12 +222,20 @@ spec:
               FOR EACH ROW
               EXECUTE FUNCTION graphql.set_updated_at();
 
+              DROP TRIGGER IF EXISTS tr_async_operation_outbox_set_updated_at ON graphql.async_operation_outbox;
+              CREATE TRIGGER tr_async_operation_outbox_set_updated_at
+              BEFORE UPDATE ON graphql.async_operation_outbox
+              FOR EACH ROW
+              EXECUTE FUNCTION graphql.set_updated_at();
+
               DO $$$$
               BEGIN
                 IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'graphql_admin') THEN
                   GRANT USAGE ON SCHEMA graphql TO graphql_admin;
                   GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE graphql.client_async_messages TO graphql_admin;
+                  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE graphql.async_operation_outbox TO graphql_admin;
                   GRANT USAGE, SELECT, UPDATE ON SEQUENCE graphql.client_async_messages_id_seq TO graphql_admin;
+                  GRANT USAGE, SELECT, UPDATE ON SEQUENCE graphql.async_operation_outbox_id_seq TO graphql_admin;
                 END IF;
                 IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'graphql_ro') THEN
                   GRANT USAGE ON SCHEMA graphql TO graphql_ro;
@@ -242,7 +295,10 @@ spec:
                     columns: [
                       "id", "request_id", "client_id", "status", "request_payload", "response_payload",
                       "error_payload", "kafka_topic", "kafka_partition", "kafka_offset", "metadata",
-                      "created_at", "updated_at", "completed_at", "expires_at"
+                      "created_at", "updated_at", "completed_at", "expires_at", "operation_type",
+                      "operation_version", "handler", "operation", "priority", "not_before",
+                      "attempt_count", "max_attempts", "cancel_requested_at", "leased_at", "started_at",
+                      "next_attempt_at"
                     ],
                     filter: { client_id: { _eq: "X-Hasura-User-Id" } },
                     allow_aggregations: true,
@@ -292,7 +348,10 @@ spec:
                     columns: [
                       "id", "request_id", "client_id", "status", "request_payload", "response_payload",
                       "error_payload", "kafka_topic", "kafka_partition", "kafka_offset", "metadata",
-                      "created_at", "updated_at", "completed_at", "expires_at"
+                      "created_at", "updated_at", "completed_at", "expires_at", "operation_type",
+                      "operation_version", "handler", "operation", "priority", "not_before",
+                      "attempt_count", "max_attempts", "cancel_requested_at", "leased_at", "started_at",
+                      "next_attempt_at"
                     ],
                     filter: {},
                     allow_aggregations: true,
@@ -332,7 +391,8 @@ spec:
                     permission: {
                       columns: [
                         "status", "response_payload", "error_payload", "kafka_partition", "kafka_offset",
-                        "metadata", "completed_at", "expires_at"
+                        "metadata", "completed_at", "expires_at", "attempt_count", "cancel_requested_at",
+                        "leased_at", "started_at", "next_attempt_at"
                       ],
                       filter: {},
                       check: {}
@@ -377,6 +437,48 @@ spec:
                 metadata_post "${CREATE_ACTION_PAYLOAD}"
               fi
 
+              if ! action_exists "cancel_async_operation"; then
+                CREATE_CANCEL_ACTION_PAYLOAD="$(jq -n \
+                  --arg handler "${ASYNC_CANCEL_ACTION_HANDLER_URL}" '{
+                    type: "create_action",
+                    args: {
+                      name: "cancel_async_operation",
+                      definition: {
+                        type: "mutation",
+                        kind: "synchronous",
+                        handler: $handler,
+                        timeout: 30,
+                        forward_client_headers: true,
+                        arguments: [{ name: "input", type: "json!" }],
+                        output_type: "json"
+                      },
+                      comment: "managed-by=graphql-async-bootstrap generic-operation-control"
+                    }
+                  }')"
+                metadata_post "${CREATE_CANCEL_ACTION_PAYLOAD}"
+              fi
+
+              if ! action_exists "retry_async_operation"; then
+                CREATE_RETRY_ACTION_PAYLOAD="$(jq -n \
+                  --arg handler "${ASYNC_RETRY_ACTION_HANDLER_URL}" '{
+                    type: "create_action",
+                    args: {
+                      name: "retry_async_operation",
+                      definition: {
+                        type: "mutation",
+                        kind: "synchronous",
+                        handler: $handler,
+                        timeout: 30,
+                        forward_client_headers: true,
+                        arguments: [{ name: "input", type: "json!" }],
+                        output_type: "json"
+                      },
+                      comment: "managed-by=graphql-async-bootstrap generic-operation-control"
+                    }
+                  }')"
+                metadata_post "${CREATE_RETRY_ACTION_PAYLOAD}"
+              fi
+
               ACTION_ROLES_CSV="$(printf '%s' "${ASYNC_REQUEST_ACTION_ROLES:-${ASYNC_CLIENT_ROLE},${ASYNC_SERVICE_ROLE}}" | tr -d '[:space:]')"
               if [ -n "${ACTION_ROLES_CSV}" ]; then
                 PREV_IFS="${IFS}"
@@ -396,6 +498,19 @@ spec:
                     }')"
                     metadata_post "${CREATE_ACTION_PERMISSION_PAYLOAD}"
                   fi
+                  for control_action in cancel_async_operation retry_async_operation; do
+                    if ! action_permission_exists "${control_action}" "${role}"; then
+                      CREATE_CONTROL_PERMISSION_PAYLOAD="$(jq -n --arg role "${role}" --arg action "${control_action}" '{
+                        type: "create_action_permission",
+                        args: {
+                          action: $action,
+                          role: $role,
+                          comment: "managed-by=graphql-async-bootstrap generic-operation-control"
+                        }
+                      }')"
+                      metadata_post "${CREATE_CONTROL_PERMISSION_PAYLOAD}"
+                    fi
+                  done
                 done
                 IFS="${PREV_IFS}"
               fi

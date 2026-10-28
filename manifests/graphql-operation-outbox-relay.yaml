@@ -1,0 +1,329 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: graphql-operation-outbox-relay
+  namespace: graphql
+data:
+  relay.py: |
+    #!/usr/bin/env python3
+    import json
+    import os
+    import signal
+    import socket
+    import time
+    import traceback
+    from datetime import datetime, timezone
+
+    import psycopg
+    from kafka import KafkaProducer
+
+    KAFKA_BOOTSTRAP_SERVERS = [
+      item.strip()
+      for item in os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka.kafka.svc.internal.lan:9092").split(",")
+      if item.strip()
+    ]
+    KAFKA_USERNAME_PATH = os.environ.get("KAFKA_USERNAME_PATH", "/vault/secrets/kafka-async-username")
+    KAFKA_PASSWORD_PATH = os.environ.get("KAFKA_PASSWORD_PATH", "/vault/secrets/kafka-async-password")
+    DB_URL_PATH = os.environ.get("DB_URL_PATH", "/vault/secrets/db-url")
+    POLL_SECONDS = max(float(os.environ.get("POLL_SECONDS", "0.5")), 0.1)
+    BATCH_SIZE = max(min(int(os.environ.get("BATCH_SIZE", "25")), 100), 1)
+    LOCK_TIMEOUT_SECONDS = max(int(os.environ.get("LOCK_TIMEOUT_SECONDS", "120")), 30)
+    RELAY_ID = os.environ.get("RELAY_ID", socket.gethostname()).strip() or socket.gethostname()
+    HEARTBEAT_PATH = os.environ.get("HEARTBEAT_PATH", "/tmp/health/heartbeat")
+    RUNNING = True
+
+    CLAIM_SQL = """
+    SELECT o.id, o.request_id, o.kafka_topic, o.message_key, o.payload,
+           o.publish_attempts, o.max_publish_attempts
+    FROM graphql.async_operation_outbox o
+    JOIN graphql.client_async_messages m ON m.request_id = o.request_id
+    WHERE o.published_at IS NULL
+      AND o.publish_attempts < o.max_publish_attempts
+      AND o.available_at <= NOW()
+      AND (o.locked_at IS NULL OR o.locked_at < NOW() - (%s * INTERVAL '1 second'))
+      AND m.status IN ('accepted', 'pending', 'queued', 'scheduled', 'retry-scheduled')
+      AND m.cancel_requested_at IS NULL
+      AND (m.not_before IS NULL OR m.not_before <= NOW())
+      AND (m.expires_at IS NULL OR m.expires_at > NOW())
+    ORDER BY
+      CASE m.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 ELSE 4 END,
+      o.available_at,
+      o.id
+    LIMIT %s
+    FOR UPDATE OF o SKIP LOCKED
+    """
+
+    MARK_LOCKED_SQL = """
+    UPDATE graphql.async_operation_outbox
+    SET locked_at = NOW(), locked_by = %s, updated_at = NOW()
+    WHERE id = %s
+    """
+
+    VERIFY_OPERATION_SQL = """
+    SELECT status, cancel_requested_at, expires_at
+    FROM graphql.client_async_messages
+    WHERE request_id = %s
+    FOR UPDATE
+    """
+
+    DISCARD_OUTBOX_SQL = """
+    DELETE FROM graphql.async_operation_outbox
+    WHERE id = %s AND published_at IS NULL
+    """
+
+    MARK_PUBLISHED_SQL = """
+    UPDATE graphql.async_operation_outbox
+    SET published_at = NOW(), kafka_partition = %s, kafka_offset = %s,
+        locked_at = NULL, locked_by = NULL, last_error = NULL, updated_at = NOW()
+    WHERE id = %s
+    """
+
+    MARK_OPERATION_PUBLISHED_SQL = """
+    UPDATE graphql.client_async_messages
+    SET status = 'queued', kafka_topic = %s, kafka_partition = %s, kafka_offset = %s,
+        metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
+          'request_published', true,
+          'request_published_at', NOW(),
+          'outbox_relay', %s
+        ),
+        updated_at = NOW()
+    WHERE request_id = %s AND status IN ('accepted', 'pending', 'queued', 'scheduled', 'retry-scheduled')
+    """
+
+    MARK_FAILED_SQL = """
+    UPDATE graphql.async_operation_outbox
+    SET publish_attempts = publish_attempts + 1,
+        available_at = NOW() + (LEAST(300, POWER(2, LEAST(publish_attempts, 8))) * INTERVAL '1 second'),
+        locked_at = NULL, locked_by = NULL, last_error = %s, updated_at = NOW()
+    WHERE id = %s
+    RETURNING publish_attempts, max_publish_attempts
+    """
+
+    MARK_DEAD_LETTERED_SQL = """
+    UPDATE graphql.client_async_messages
+    SET status = 'dead-lettered',
+        error_payload = jsonb_build_object(
+          'code', 'OUTBOX_PUBLISH_FAILED',
+          'message', %s,
+          'retryable', true
+        ),
+        completed_at = NOW(), updated_at = NOW()
+    WHERE request_id = %s
+    """
+
+    def log(message):
+      print(f"[{datetime.now(timezone.utc).isoformat()}] {message}", flush=True)
+
+    def signal_handler(signum, _frame):
+      global RUNNING
+      RUNNING = False
+      log(f"Received signal {signum}, shutting down")
+
+    def wait_for_file(path):
+      while RUNNING:
+        if os.path.isfile(path) and os.path.getsize(path) > 0:
+          return
+        time.sleep(2)
+      raise RuntimeError("stopped while waiting for secret files")
+
+    def read_secret(path, label):
+      wait_for_file(path)
+      with open(path, "r", encoding="utf-8") as handle:
+        value = handle.read().strip()
+      if not value:
+        raise RuntimeError(f"{label} is empty")
+      return value
+
+    def heartbeat():
+      os.makedirs(os.path.dirname(HEARTBEAT_PATH), exist_ok=True)
+      with open(HEARTBEAT_PATH, "w", encoding="utf-8") as handle:
+        handle.write(str(time.time()))
+
+    def build_producer(username, password):
+      return KafkaProducer(
+        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+        security_protocol="SASL_PLAINTEXT",
+        sasl_mechanism="SCRAM-SHA-256",
+        sasl_plain_username=username,
+        sasl_plain_password=password,
+        acks="all",
+        retries=10,
+        enable_idempotence=True,
+        max_in_flight_requests_per_connection=5,
+        linger_ms=10,
+        request_timeout_ms=30000,
+      )
+
+    def relay_batch(conn, producer):
+      with conn.cursor() as cur:
+        cur.execute(CLAIM_SQL, (LOCK_TIMEOUT_SECONDS, BATCH_SIZE))
+        rows = cur.fetchall()
+        for row in rows:
+          cur.execute(MARK_LOCKED_SQL, (RELAY_ID, row[0]))
+      conn.commit()
+      published = 0
+      for row in rows:
+        if not RUNNING:
+          break
+        outbox_id, request_id, topic, message_key, payload, _attempts, _max_attempts = row
+        try:
+          with conn.cursor() as cur:
+            cur.execute(VERIFY_OPERATION_SQL, (request_id,))
+            operation_row = cur.fetchone()
+            if (
+              not operation_row
+              or str(operation_row[0]) not in ("accepted", "pending", "queued", "scheduled", "retry-scheduled")
+              or operation_row[1] is not None
+              or (operation_row[2] is not None and operation_row[2] <= datetime.now(timezone.utc))
+            ):
+              cur.execute(DISCARD_OUTBOX_SQL, (outbox_id,))
+              conn.commit()
+              continue
+          value = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+          record = producer.send(
+            str(topic),
+            key=str(message_key).encode("utf-8"),
+            value=value,
+          ).get(timeout=30)
+          with conn.cursor() as cur:
+            cur.execute(MARK_PUBLISHED_SQL, (record.partition, record.offset, outbox_id))
+            cur.execute(
+              MARK_OPERATION_PUBLISHED_SQL,
+              (str(topic), record.partition, record.offset, RELAY_ID, request_id),
+            )
+          conn.commit()
+          published += 1
+        except Exception as exc:
+          conn.rollback()
+          error = f"{type(exc).__name__}: {exc}"[:4000]
+          with conn.cursor() as cur:
+            cur.execute(MARK_FAILED_SQL, (error, outbox_id))
+            failed = cur.fetchone()
+            if failed and int(failed[0]) >= int(failed[1]):
+              cur.execute(MARK_DEAD_LETTERED_SQL, (error, request_id))
+          conn.commit()
+          log(f"Publish failed outbox_id={outbox_id} request_id={request_id}: {error}")
+      return published
+
+    def main():
+      signal.signal(signal.SIGTERM, signal_handler)
+      signal.signal(signal.SIGINT, signal_handler)
+      username = read_secret(KAFKA_USERNAME_PATH, "Kafka username")
+      password = read_secret(KAFKA_PASSWORD_PATH, "Kafka password")
+      db_url = read_secret(DB_URL_PATH, "database URL")
+      producer = build_producer(username, password)
+      log(f"Operation outbox relay started id={RELAY_ID}")
+      try:
+        while RUNNING:
+          try:
+            with psycopg.connect(db_url, connect_timeout=10) as conn:
+              while RUNNING:
+                count = relay_batch(conn, producer)
+                heartbeat()
+                if count == 0:
+                  time.sleep(POLL_SECONDS)
+          except Exception as exc:
+            log(f"Relay loop failed: {exc}")
+            traceback.print_exc()
+            time.sleep(5)
+      finally:
+        producer.flush(timeout=10)
+        producer.close(timeout=10)
+
+    if __name__ == "__main__":
+      main()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: graphql-operation-outbox-relay
+  namespace: graphql
+  annotations:
+    argocd.argoproj.io/sync-wave: "4"
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: graphql-operation-outbox-relay
+  template:
+    metadata:
+      labels:
+        app: graphql-operation-outbox-relay
+      annotations:
+        linkerd.io/inject: "disabled"
+        reloader.stakater.com/auto: "true"
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "graphql-async-response-writer"
+        vault.hashicorp.com/agent-inject-secret-kafka-async-username: "secret/data/graphql-kafka-async-username"
+        vault.hashicorp.com/agent-inject-template-kafka-async-username: |
+          {{- with secret "secret/data/graphql-kafka-async-username" -}}
+          {{ .Data.data.value }}
+          {{- end }}
+        vault.hashicorp.com/agent-inject-secret-kafka-async-password: "secret/data/graphql-kafka-async-password"
+        vault.hashicorp.com/agent-inject-template-kafka-async-password: |
+          {{- with secret "secret/data/graphql-kafka-async-password" -}}
+          {{ .Data.data.value }}
+          {{- end }}
+        vault.hashicorp.com/agent-inject-secret-db-url: "yugabyte-db/static-creds/graphql-yb-admin"
+        vault.hashicorp.com/agent-inject-template-db-url: |
+          {{- with secret "yugabyte-db/static-creds/graphql-yb-admin" -}}
+          postgresql://{{ .Data.username }}:{{ .Data.password }}@yb-tserver-service.yugabyte.svc.cluster.local:5433/hasura?sslmode=disable
+          {{- end }}
+    spec:
+      serviceAccountName: graphql-async-response-writer
+      containers:
+        - name: relay
+          image: python:3.12-slim
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: "kafka.kafka.svc.internal.lan:9092"
+            - name: KAFKA_USERNAME_PATH
+              value: "/vault/secrets/kafka-async-username"
+            - name: KAFKA_PASSWORD_PATH
+              value: "/vault/secrets/kafka-async-password"
+            - name: DB_URL_PATH
+              value: "/vault/secrets/db-url"
+            - name: BATCH_SIZE
+              value: "25"
+            - name: POLL_SECONDS
+              value: "0.5"
+            - name: HEARTBEAT_PATH
+              value: "/tmp/health/heartbeat"
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              set -euo pipefail
+              pip install --no-cache-dir --disable-pip-version-check \
+                "kafka-python>=2.0.2,<3.0.0" \
+                "psycopg[binary]>=3.1.0,<4.0.0"
+              exec python /opt/config/relay.py
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "test -s /tmp/health/heartbeat && test $(( $(date +%s) - $(cut -d. -f1 /tmp/health/heartbeat) )) -lt 30"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "test -s /tmp/health/heartbeat && test $(( $(date +%s) - $(cut -d. -f1 /tmp/health/heartbeat) )) -lt 120"]
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 50m
+              memory: 96Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: relay-config
+              mountPath: /opt/config
+              readOnly: true
+      volumes:
+        - name: relay-config
+          configMap:
+            name: graphql-operation-outbox-relay
+            defaultMode: 0555

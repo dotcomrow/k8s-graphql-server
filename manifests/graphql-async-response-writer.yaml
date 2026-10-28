@@ -14,6 +14,7 @@ data:
     #!/usr/bin/env python3
     import json
     import os
+    import random
     import signal
     import time
     import traceback
@@ -58,7 +59,31 @@ data:
       expires_at = COALESCE(%s::timestamptz, expires_at),
       updated_at = NOW()
     WHERE request_id = %s
-    RETURNING id
+      AND status NOT IN ('cancelled', 'expired')
+    RETURNING id, request_payload, kafka_topic, attempt_count, max_attempts
+    """
+
+    SCHEDULE_RETRY_SQL = """
+    UPDATE graphql.client_async_messages
+    SET status = 'retry-scheduled',
+        attempt_count = attempt_count + 1,
+        next_attempt_at = NOW() + (%s * INTERVAL '1 second'),
+        completed_at = NULL,
+        metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
+          'retry_scheduled_at', NOW(),
+          'retry_backoff_seconds', %s
+        ),
+        updated_at = NOW()
+    WHERE request_id = %s
+    RETURNING next_attempt_at
+    """
+
+    INSERT_RETRY_OUTBOX_SQL = """
+    INSERT INTO graphql.async_operation_outbox (
+      request_id, event_type, kafka_topic, message_key, payload, available_at
+    ) VALUES (
+      %s, 'operation.retry-requested', %s, %s, %s::jsonb, %s::timestamptz
+    )
     """
 
     INSERT_SQL = """
@@ -99,6 +124,7 @@ data:
       completed_at = COALESCE(EXCLUDED.completed_at, graphql.client_async_messages.completed_at),
       expires_at = COALESCE(EXCLUDED.expires_at, graphql.client_async_messages.expires_at),
       updated_at = NOW()
+    WHERE graphql.client_async_messages.status NOT IN ('cancelled', 'expired')
     RETURNING id
     """
 
@@ -255,6 +281,16 @@ data:
       else:
         status = "completed"
 
+      status = {
+        "completed": "succeeded",
+        "complete": "succeeded",
+        "success": "succeeded",
+        "error": "failed",
+        "canceled": "cancelled",
+        "retry_scheduled": "retry-scheduled",
+        "dead_lettered": "dead-lettered",
+      }.get(status, status)
+
       response_payload = payload.get("response_payload", payload.get("response"))
       error_payload = payload.get("error_payload", payload.get("error"))
 
@@ -265,9 +301,11 @@ data:
       metadata["source_partition"] = message.partition
       metadata["source_offset"] = message.offset
       metadata["ingested_by"] = "graphql-async-response-writer"
+      if isinstance(payload.get("progress"), dict):
+        metadata["progress"] = payload["progress"]
 
       completed_at = parse_timestamp(payload.get("completed_at"))
-      if completed_at is None and status in ("completed", "error"):
+      if completed_at is None and status in ("succeeded", "failed", "cancelled", "expired", "dead-lettered"):
         completed_at = datetime.now(timezone.utc)
       expires_at = parse_timestamp(payload.get("expires_at"))
 
@@ -304,7 +342,29 @@ data:
             record["request_id"],
           ),
         )
-        if cur.fetchone():
+        updated = cur.fetchone()
+        if updated:
+          retryable = isinstance(record["error_payload"], dict) and record["error_payload"].get("retryable") is True
+          attempt_count = int(updated[3] or 0)
+          max_attempts = max(int(updated[4] or 1), 1)
+          if record["status"] == "failed" and retryable and attempt_count + 1 < max_attempts:
+            backoff_seconds = min(300, (2 ** min(attempt_count, 8)) + random.uniform(0, 1))
+            cur.execute(
+              SCHEDULE_RETRY_SQL,
+              (backoff_seconds, backoff_seconds, record["request_id"]),
+            )
+            retry_row = cur.fetchone()
+            cur.execute(
+              INSERT_RETRY_OUTBOX_SQL,
+              (
+                record["request_id"],
+                str(updated[2] or "graphql.async.requests.v1"),
+                record["request_id"],
+                json_text(updated[1]),
+                retry_row[0],
+              ),
+            )
+            return "retry-scheduled"
           return "updated"
 
         if not record["client_id"]:
@@ -326,8 +386,8 @@ data:
             record["expires_at"],
           ),
         )
-        cur.fetchone()
-        return "inserted"
+        inserted = cur.fetchone()
+        return "inserted" if inserted else "ignored_terminal"
 
 
     def commit_message(consumer, message):
@@ -459,7 +519,7 @@ metadata:
     argocd.argoproj.io/sync-wave: "4"
     reloader.stakater.com/auto: "true"
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: graphql-async-response-writer
@@ -528,6 +588,13 @@ spec:
                 "kafka-python>=2.0.2,<3.0.0" \
                 "psycopg[binary]>=3.1.0,<4.0.0"
               exec python /opt/config/writer.py
+          resources:
+            requests:
+              cpu: 50m
+              memory: 96Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
           volumeMounts:
             - name: writer-config
               mountPath: /opt/config

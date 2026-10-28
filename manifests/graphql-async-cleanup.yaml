@@ -107,37 +107,46 @@ spec:
 
                   batch_size="${CLEANUP_BATCH_SIZE:-1000}"
                   max_batches="${CLEANUP_MAX_BATCHES:-100}"
-                  total_deleted=0
+                  total_expired=0
                   batch_num=0
 
                   while [ "${batch_num}" -lt "${max_batches}" ]; do
-                    delete_expired_sql="WITH doomed AS (
+                    mark_expired_sql="WITH doomed AS (
                       SELECT id
                       FROM graphql.client_async_messages
                       WHERE expires_at IS NOT NULL
                         AND expires_at < NOW()
+                        AND status NOT IN ('succeeded', 'completed', 'failed', 'error', 'cancelled', 'expired', 'dead-lettered')
                       ORDER BY expires_at, id
                       LIMIT ${batch_size}
                     ),
-                    deleted AS (
-                      DELETE FROM graphql.client_async_messages AS m
-                      USING doomed
+                    expired AS (
+                      UPDATE graphql.client_async_messages AS m
+                      SET status = 'expired',
+                          error_payload = COALESCE(error_payload, jsonb_build_object(
+                            'code', 'OPERATION_EXPIRED',
+                            'message', 'Operation expired before successful completion.',
+                            'retryable', false
+                          )),
+                          completed_at = COALESCE(completed_at, NOW()),
+                          updated_at = NOW()
+                      FROM doomed
                       WHERE m.id = doomed.id
                       RETURNING 1
                     )
-                    SELECT COUNT(*) FROM deleted;"
-                    deleted="$(psql_with_retry "${delete_expired_sql}")"
-                    deleted="$(echo "${deleted:-0}" | tr -d '[:space:]')"
-                    if [ -z "${deleted}" ]; then
-                      deleted=0
+                    SELECT COUNT(*) FROM expired;"
+                    expired="$(psql_with_retry "${mark_expired_sql}")"
+                    expired="$(echo "${expired:-0}" | tr -d '[:space:]')"
+                    if [ -z "${expired}" ]; then
+                      expired=0
                     fi
 
-                    total_deleted=$((total_deleted + deleted))
+                    total_expired=$((total_expired + expired))
                     batch_num=$((batch_num + 1))
 
-                    if [ "${deleted}" -lt "${batch_size}" ]; then
+                    if [ "${expired}" -lt "${batch_size}" ]; then
                       break
                     fi
                   done
 
-                  echo "Deleted ${total_deleted} expired row(s) from graphql.client_async_messages in ${batch_num} batch(es)"
+                  echo "Marked ${total_expired} expired operation(s) in graphql.client_async_messages in ${batch_num} batch(es)"

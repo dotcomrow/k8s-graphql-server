@@ -1,0 +1,287 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: graphql-operation-test-worker
+  namespace: graphql
+data:
+  worker.py: |
+    #!/usr/bin/env python3
+    import json
+    import os
+    import signal
+    import socket
+    import time
+    import traceback
+    from datetime import datetime, timezone
+
+    from kafka import KafkaConsumer, KafkaProducer
+    from kafka.structs import OffsetAndMetadata, TopicPartition
+
+    REQUEST_TOPIC = os.environ.get("REQUEST_TOPIC", "graphql.async.requests.v1").strip()
+    RESPONSE_TOPIC = os.environ.get("RESPONSE_TOPIC", "graphql.async.responses.v1").strip()
+    CONSUMER_GROUP = os.environ.get("CONSUMER_GROUP", "graphql-operation-test-worker-v1").strip()
+    HANDLER = os.environ.get("HANDLER", "platform-test-worker").strip().lower()
+    WORKER_ID = os.environ.get("WORKER_ID", socket.gethostname()).strip()
+    KAFKA_BOOTSTRAP_SERVERS = [
+      item.strip()
+      for item in os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka.kafka.svc.internal.lan:9092").split(",")
+      if item.strip()
+    ]
+    KAFKA_USERNAME_PATH = os.environ.get("KAFKA_USERNAME_PATH", "/vault/secrets/kafka-async-username")
+    KAFKA_PASSWORD_PATH = os.environ.get("KAFKA_PASSWORD_PATH", "/vault/secrets/kafka-async-password")
+    HEARTBEAT_PATH = os.environ.get("HEARTBEAT_PATH", "/tmp/health/heartbeat")
+    RUNNING = True
+
+    def iso_now():
+      return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def log(message):
+      print(f"[{iso_now()}] {message}", flush=True)
+
+    def signal_handler(signum, _frame):
+      global RUNNING
+      RUNNING = False
+      log(f"Received signal {signum}, shutting down")
+
+    def read_secret(path, label):
+      while RUNNING and (not os.path.isfile(path) or os.path.getsize(path) == 0):
+        time.sleep(2)
+      if not RUNNING:
+        raise RuntimeError("stopped while waiting for secret files")
+      with open(path, "r", encoding="utf-8") as handle:
+        value = handle.read().strip()
+      if not value:
+        raise RuntimeError(f"{label} is empty")
+      return value
+
+    def heartbeat():
+      os.makedirs(os.path.dirname(HEARTBEAT_PATH), exist_ok=True)
+      with open(HEARTBEAT_PATH, "w", encoding="utf-8") as handle:
+        handle.write(str(time.time()))
+
+    def kafka_config(username, password):
+      return {
+        "bootstrap_servers": KAFKA_BOOTSTRAP_SERVERS,
+        "security_protocol": "SASL_PLAINTEXT",
+        "sasl_mechanism": "SCRAM-SHA-256",
+        "sasl_plain_username": username,
+        "sasl_plain_password": password,
+      }
+
+    def publish(producer, request_id, client_id, status, metadata, reply_topic, **extra):
+      message = {
+        "spec_version": "async.response.v1",
+        "request_id": request_id,
+        "client_id": client_id,
+        "status": status,
+        "metadata": {**metadata, "worker": WORKER_ID, "handler": HANDLER},
+        **extra,
+      }
+      if status in ("succeeded", "failed"):
+        message["completed_at"] = iso_now()
+      producer.send(
+        reply_topic,
+        key=request_id.encode("utf-8"),
+        value=json.dumps(message, separators=(",", ":"), ensure_ascii=False).encode("utf-8"),
+      ).get(timeout=20)
+
+    def commit(consumer, record):
+      partition = TopicPartition(record.topic, record.partition)
+      try:
+        offset = OffsetAndMetadata(record.offset + 1, "", -1)
+      except TypeError:
+        offset = OffsetAndMetadata(record.offset + 1, "")
+      consumer.commit({partition: offset})
+
+    def handle(producer, record):
+      envelope = json.loads(record.value.decode("utf-8"))
+      if not isinstance(envelope, dict):
+        raise ValueError("request envelope must be an object")
+      route = envelope.get("route") if isinstance(envelope.get("route"), dict) else {}
+      if str(route.get("handler") or "").strip().lower() != HANDLER:
+        return
+      operation = str(route.get("operation") or "").strip().lower()
+      request_id = str(envelope.get("request_id") or record.key.decode("utf-8")).strip()
+      client_id = str(envelope.get("client_id") or "").strip()
+      payload = envelope.get("payload") if isinstance(envelope.get("payload"), dict) else {}
+      options = envelope.get("options") if isinstance(envelope.get("options"), dict) else {}
+      metadata = envelope.get("metadata") if isinstance(envelope.get("metadata"), dict) else {}
+      reply_topic = str(options.get("reply_topic") or RESPONSE_TOPIC).strip() or RESPONSE_TOPIC
+
+      publish(
+        producer,
+        request_id,
+        client_id,
+        "running",
+        metadata,
+        reply_topic,
+        progress={"sequence": 1, "percent": 5, "message": "Operation accepted by test worker", "updated_at": iso_now()},
+      )
+
+      if operation == "echo":
+        result = {"echo": payload, "handled_at": iso_now(), "worker": WORKER_ID}
+      elif operation == "delay":
+        delay_seconds = max(0.0, min(float(payload.get("delay_seconds", 1)), 30.0))
+        time.sleep(delay_seconds)
+        result = {"delay_seconds": delay_seconds, "payload": payload.get("value"), "handled_at": iso_now()}
+      elif operation == "fail":
+        raise RuntimeError(str(payload.get("message") or "requested test failure"))
+      else:
+        raise ValueError(f"unsupported operation: {operation}")
+
+      publish(
+        producer,
+        request_id,
+        client_id,
+        "succeeded",
+        metadata,
+        reply_topic,
+        progress={"sequence": 2, "percent": 100, "message": "Operation completed", "updated_at": iso_now()},
+        response_payload=result,
+      )
+
+    def main():
+      signal.signal(signal.SIGTERM, signal_handler)
+      signal.signal(signal.SIGINT, signal_handler)
+      username = read_secret(KAFKA_USERNAME_PATH, "Kafka username")
+      password = read_secret(KAFKA_PASSWORD_PATH, "Kafka password")
+      common = kafka_config(username, password)
+      consumer = KafkaConsumer(
+        REQUEST_TOPIC,
+        group_id=CONSUMER_GROUP,
+        enable_auto_commit=False,
+        auto_offset_reset="latest",
+        consumer_timeout_ms=1000,
+        max_poll_records=10,
+        **common,
+      )
+      producer = KafkaProducer(acks="all", retries=10, **common)
+      log(f"Generic operation test worker started handler={HANDLER} group={CONSUMER_GROUP}")
+      try:
+        while RUNNING:
+          heartbeat()
+          batches = consumer.poll(timeout_ms=1000, max_records=10)
+          for records in batches.values():
+            for record in records:
+              envelope = {}
+              try:
+                envelope = json.loads(record.value.decode("utf-8"))
+                handle(producer, record)
+                commit(consumer, record)
+              except Exception as exc:
+                traceback.print_exc()
+                route = envelope.get("route") if isinstance(envelope, dict) and isinstance(envelope.get("route"), dict) else {}
+                if str(route.get("handler") or "").strip().lower() != HANDLER:
+                  commit(consumer, record)
+                  continue
+                request_id = str(envelope.get("request_id") or "").strip()
+                if not request_id:
+                  commit(consumer, record)
+                  continue
+                options = envelope.get("options") if isinstance(envelope.get("options"), dict) else {}
+                metadata = envelope.get("metadata") if isinstance(envelope.get("metadata"), dict) else {}
+                publish(
+                  producer,
+                  request_id,
+                  str(envelope.get("client_id") or ""),
+                  "failed",
+                  metadata,
+                  str(options.get("reply_topic") or RESPONSE_TOPIC),
+                  error_payload={"code": "TEST_OPERATION_FAILED", "message": str(exc), "retryable": False},
+                )
+                commit(consumer, record)
+      finally:
+        producer.flush(timeout=10)
+        producer.close(timeout=10)
+        consumer.close(timeout=10)
+
+    if __name__ == "__main__":
+      main()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: graphql-operation-test-worker
+  namespace: graphql
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: graphql-operation-test-worker
+  template:
+    metadata:
+      labels:
+        app: graphql-operation-test-worker
+      annotations:
+        linkerd.io/inject: "disabled"
+        reloader.stakater.com/auto: "true"
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "graphql-async-response-writer"
+        vault.hashicorp.com/agent-inject-secret-kafka-async-username: "secret/data/graphql-kafka-async-username"
+        vault.hashicorp.com/agent-inject-template-kafka-async-username: |
+          {{- with secret "secret/data/graphql-kafka-async-username" -}}
+          {{ .Data.data.value }}
+          {{- end }}
+        vault.hashicorp.com/agent-inject-secret-kafka-async-password: "secret/data/graphql-kafka-async-password"
+        vault.hashicorp.com/agent-inject-template-kafka-async-password: |
+          {{- with secret "secret/data/graphql-kafka-async-password" -}}
+          {{ .Data.data.value }}
+          {{- end }}
+    spec:
+      serviceAccountName: graphql-async-response-writer
+      containers:
+        - name: worker
+          image: python:3.12-slim
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: "kafka.kafka.svc.internal.lan:9092"
+            - name: REQUEST_TOPIC
+              value: "graphql.async.requests.v1"
+            - name: RESPONSE_TOPIC
+              value: "graphql.async.responses.v1"
+            - name: CONSUMER_GROUP
+              value: "graphql-operation-test-worker-v1"
+            - name: HANDLER
+              value: "platform-test-worker"
+            - name: KAFKA_USERNAME_PATH
+              value: "/vault/secrets/kafka-async-username"
+            - name: KAFKA_PASSWORD_PATH
+              value: "/vault/secrets/kafka-async-password"
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              set -euo pipefail
+              pip install --no-cache-dir --disable-pip-version-check "kafka-python>=2.0.2,<3.0.0"
+              exec python /opt/config/worker.py
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "test -s /tmp/health/heartbeat && test $(( $(date +%s) - $(cut -d. -f1 /tmp/health/heartbeat) )) -lt 30"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "test -s /tmp/health/heartbeat && test $(( $(date +%s) - $(cut -d. -f1 /tmp/health/heartbeat) )) -lt 120"]
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 192Mi
+          volumeMounts:
+            - name: worker-config
+              mountPath: /opt/config
+              readOnly: true
+      volumes:
+        - name: worker-config
+          configMap:
+            name: graphql-operation-test-worker
+            defaultMode: 0555

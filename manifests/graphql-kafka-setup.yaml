@@ -79,6 +79,10 @@ spec:
               value: "4096"
             - name: KAFKA_CONSUMER_GROUP
               value: "graphql-async-workers"
+            - name: KAFKA_RESPONSE_CONSUMER_GROUP
+              value: "graphql-async-response-writer"
+            - name: KAFKA_OPERATION_GROUP_PREFIX
+              value: "graphql-operation-"
             - name: KAFKA_ADMIN_CLIENT_CONFIG_PATH
               value: ""
           command: ["/bin/bash", "-lc"]
@@ -290,6 +294,8 @@ spec:
                 add_acl --topic "${KAFKA_RESPONSE_TOPIC}" --operation Read --operation Write --operation Describe
                 add_acl --topic "${KAFKA_DLQ_TOPIC}" --operation Read --operation Write --operation Describe
                 add_acl --group "${KAFKA_CONSUMER_GROUP}" --operation Read --operation Describe
+                add_acl --group "${KAFKA_RESPONSE_CONSUMER_GROUP}" --operation Read --operation Describe
+                add_acl --resource-pattern-type prefixed --group "${KAFKA_OPERATION_GROUP_PREFIX}" --operation Read --operation Describe
                 kafka_cli_retry kafka-acls.sh --list
               fi
 

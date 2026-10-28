@@ -54,12 +54,20 @@ This repo includes idempotent bootstrap jobs for the async GraphQL + Kafka flow:
 - `manifests/graphql-async-request-publisher.yaml`
   - Runs a Hasura Action handler (`Deployment` + `Service`) for generic async request publishing.
   - Handles action `publish_async_request`.
-  - Inserts/updates a `pending` record in `graphql.client_async_messages`.
-  - Publishes a generic request envelope to topic `graphql.async.requests.v1`.
+  - Atomically inserts a queued operation and its transactional outbox record.
+  - Handles lifecycle actions `cancel_async_operation` and `retry_async_operation`.
+- `manifests/graphql-operation-outbox-relay.yaml`
+  - Runs two relay replicas using `FOR UPDATE SKIP LOCKED` claims.
+  - Publishes committed outbox envelopes to Kafka with at-least-once delivery.
+  - Applies bounded exponential retry and marks exhausted publication attempts dead-lettered.
+- `manifests/graphql-operation-test-worker.yaml`
+  - Provides the generic test handler `platform-test-worker`.
+  - Supports `echo`, `delay`, and `fail` for end-to-end platform validation.
+  - Publishes progress and terminal responses without application-specific behavior.
 - `manifests/graphql-async-cleanup.yaml`
   - Runs a scheduled cleanup (`CronJob`) every 10 minutes.
-  - Deletes expired rows from `graphql.client_async_messages` where `expires_at < NOW()`.
-  - Deletes in batches to avoid large one-shot transactions.
+  - Marks overdue nonterminal operations `expired` in bounded batches.
+  - Preserves terminal records so clients can restore authoritative results after reconnecting.
 
 Vault role/policy for the Kafka setup job are created by:
 - `manifests/00-vault-yugabyte-init.yaml`
@@ -69,11 +77,14 @@ Vault role/policy for the Kafka setup job are created by:
 kubectl -n graphql get job graphql-async-bootstrap graphql-kafka-setup
 kubectl -n graphql get deploy graphql-async-response-writer
 kubectl -n graphql get deploy graphql-async-request-publisher
+kubectl -n graphql get deploy graphql-operation-outbox-relay graphql-operation-test-worker
 kubectl -n graphql get cronjob graphql-async-cleanup
 kubectl -n graphql logs job/graphql-async-bootstrap --tail=200
 kubectl -n graphql logs job/graphql-kafka-setup --tail=200
 kubectl -n graphql logs deploy/graphql-async-response-writer --tail=200
 kubectl -n graphql logs deploy/graphql-async-request-publisher --tail=200
+kubectl -n graphql logs deploy/graphql-operation-outbox-relay --tail=200
+kubectl -n graphql logs deploy/graphql-operation-test-worker --tail=200
 kubectl -n graphql get job --sort-by=.metadata.creationTimestamp | tail -n 5
 ```
 
@@ -99,6 +110,59 @@ Recommended action input shape:
   "expires_in_seconds": 3600
 }
 ```
+
+The ingress acknowledges only after both the operation and outbox message are committed in one
+database transaction. Kafka delivery happens asynchronously, so `accepted` never means that a
+worker has started or completed the operation.
+
+Workers must use a unique consumer group for each handler implementation, use `request_id` as the
+idempotency key, and publish results to the declared response topic. Replicas of one handler share
+that handler's group; different handlers must not share a group.
+
+### Generic operation lifecycle
+
+Supported lifecycle states are `accepted`, `queued`, `scheduled`, `leased`, `running`,
+`retry-scheduled`, `cancel-requested`, `succeeded`, `failed`, `cancelled`, `expired`, and
+`dead-lettered`.
+
+```graphql
+mutation CancelOperation($input: json!) {
+  cancel_async_operation(input: $input)
+}
+
+mutation RetryOperation($input: json!) {
+  retry_async_operation(input: $input)
+}
+```
+
+Both actions accept `{ "operation_id": "..." }` and enforce ownership from the Hasura session.
+Cancellation after a worker starts is cooperative; a worker must implement that check before an
+MFE advertises the operation as cancelable.
+
+Execution expiry and historical retention are deliberately separate. The expiry job marks state
+but does not delete terminal records. A retention policy must preserve results long enough for
+suspended PWAs to restore them and should be introduced only with an explicitly approved window.
+
+### Generic test handler
+
+The platform test worker accepts this route:
+
+```json
+{
+  "handler": "platform-test-worker",
+  "operation": "echo",
+  "payload": { "message": "hello" },
+  "metadata": {
+    "operation_type": "platform.test.echo",
+    "operation_version": "1.0.0",
+    "max_attempts": 3
+  },
+  "priority": "normal"
+}
+```
+
+It also supports `delay` with `delay_seconds` capped at 30 seconds and `fail` for testing failure
+delivery.
 
 ### Async Route Authorization (Annotation-Driven)
 
@@ -127,7 +191,7 @@ Example:
 ```yaml
 metadata:
   annotations:
-    gravitee.io/definition-labels: "internal,hasura,hasura.async.handler=ai-service,hasura.action.roles=ai_user"
+    gravitee.io/definition-labels: "internal,hasura,hasura.async.handler=billing-worker,hasura.action.roles=billing_user"
 ```
 
 Operation-specific example:
@@ -135,7 +199,7 @@ Operation-specific example:
 ```yaml
 metadata:
   annotations:
-    gravitee.io/definition-labels: "internal,hasura,hasura.async.handler=ai-service,hasura.action.roles=user|service,hasura.async.operation.roles.chat.completion=ai_user"
+    gravitee.io/definition-labels: "internal,hasura,hasura.async.handler=billing-worker,hasura.action.roles=user|service,hasura.async.operation.roles.invoice.create=billing_user"
 ```
 
 Published Kafka request envelope (`graphql.async.requests.v1`):

@@ -54,6 +54,8 @@ spec:
               value: "graphql_admin"
             - name: USER_RO
               value: "graphql_ro"
+            - name: USER_OPERATION_WORKER_RO
+              value: "graphql_operation_test_worker_ro"
             - name: SCHEMAS
               value: "public graphql"
             - name: VAULT_ADDR
@@ -70,6 +72,8 @@ spec:
               value: "graphql-yb-admin"
             - name: ROLE_STATIC_RO
               value: "graphql-yb-ro"
+            - name: ROLE_STATIC_OPERATION_WORKER_RO
+              value: "graphql-operation-test-worker-yb-ro"
             - name: YSQL_SSLMODE
               value: "disable"
           command: ["/bin/sh","-c"]
@@ -84,6 +88,7 @@ spec:
               VAULTADMIN_KV_PATH="${VAULTADMIN_KV_PATH:-secret/vaultadmin}"
               USER_ADMIN="${USER_ADMIN:-graphql_admin}"
               USER_RO="${USER_RO:-graphql_ro}"
+              USER_OPERATION_WORKER_RO="${USER_OPERATION_WORKER_RO:-graphql_operation_test_worker_ro}"
               SCHEMAS="${SCHEMAS:-public graphql}"
               VAULT_ADDR="${VAULT_ADDR:-http://vault.vault.svc.cluster.local:8200}"
               AUTH_PATH="${AUTH_PATH:-kubernetes}"
@@ -91,6 +96,7 @@ spec:
               DB_NAME_IN_VAULT="${DB_NAME_IN_VAULT:-yugabyte}"
               ROLE_STATIC_ADMIN="${ROLE_STATIC_ADMIN:-graphql-yb-admin}"
               ROLE_STATIC_RO="${ROLE_STATIC_RO:-graphql-yb-ro}"
+              ROLE_STATIC_OPERATION_WORKER_RO="${ROLE_STATIC_OPERATION_WORKER_RO:-graphql-operation-test-worker-yb-ro}"
               DDL_RETRY_ATTEMPTS="${DDL_RETRY_ATTEMPTS:-5}"
               DDL_RETRY_SLEEP="${DDL_RETRY_SLEEP:-3}"
               YSQL_SSLMODE="${YSQL_SSLMODE:-disable}"
@@ -255,16 +261,29 @@ spec:
                 echo "Role ${USER_RO} exists"
               fi
 
+              OPERATION_WORKER_RO_ROLE_EXISTS="$(psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -Atc "SELECT 1 FROM pg_roles WHERE rolname='${USER_OPERATION_WORKER_RO}'" || true)"
+              if [ "${OPERATION_WORKER_RO_ROLE_EXISTS:-}" != "1" ]; then
+                echo "Creating role ${USER_OPERATION_WORKER_RO}"
+                run_psql_with_retry "create role ${USER_OPERATION_WORKER_RO}" \
+                  psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 \
+                    -c "CREATE ROLE ${USER_OPERATION_WORKER_RO} LOGIN PASSWORD 'temp-initial';"
+              else
+                echo "Role ${USER_OPERATION_WORKER_RO} exists"
+              fi
+
               run_psql_with_retry "grant ${USER_ADMIN} to ${VAULTADMIN_USER}" \
                 psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 \
                   -c "GRANT ${USER_ADMIN} TO ${VAULTADMIN_USER} WITH ADMIN OPTION;"
               run_psql_with_retry "grant ${USER_RO} to ${VAULTADMIN_USER}" \
                 psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 \
                   -c "GRANT ${USER_RO} TO ${VAULTADMIN_USER} WITH ADMIN OPTION;"
+              run_psql_with_retry "grant ${USER_OPERATION_WORKER_RO} to ${VAULTADMIN_USER}" \
+                psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 \
+                  -c "GRANT ${USER_OPERATION_WORKER_RO} TO ${VAULTADMIN_USER} WITH ADMIN OPTION;"
 
               run_psql_with_retry "grant DB privileges" \
                 psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 \
-                  -c "GRANT ALL PRIVILEGES ON DATABASE ${APP_DB} TO ${VAULTADMIN_USER}, ${USER_ADMIN}, ${USER_RO};"
+                  -c "GRANT ALL PRIVILEGES ON DATABASE ${APP_DB} TO ${VAULTADMIN_USER}, ${USER_ADMIN}; REVOKE ALL PRIVILEGES ON DATABASE ${APP_DB} FROM ${USER_RO}, ${USER_OPERATION_WORKER_RO}; GRANT CONNECT ON DATABASE ${APP_DB} TO ${USER_RO}, ${USER_OPERATION_WORKER_RO};"
 
               for schema in $SCHEMAS; do
                 run_psql_with_retry "create schema ${schema}" \
@@ -272,7 +291,7 @@ spec:
                     -c "CREATE SCHEMA IF NOT EXISTS ${schema} AUTHORIZATION ${VAULTADMIN_USER};"
                 run_psql_with_retry "grant schema ${schema}" \
                   psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 \
-                    -c "GRANT USAGE, CREATE ON SCHEMA ${schema} TO ${VAULTADMIN_USER}, ${USER_ADMIN}, ${USER_RO};"
+                    -c "GRANT USAGE, CREATE ON SCHEMA ${schema} TO ${VAULTADMIN_USER}, ${USER_ADMIN}; REVOKE CREATE ON SCHEMA ${schema} FROM ${USER_RO}, ${USER_OPERATION_WORKER_RO}; GRANT USAGE ON SCHEMA ${schema} TO ${USER_RO}, ${USER_OPERATION_WORKER_RO};"
                 run_psql_with_retry "grant tables ${schema}" \
                   psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=0 \
                     -c "GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA ${schema} TO ${VAULTADMIN_USER}, ${USER_ADMIN}, ${USER_RO};" || true
@@ -308,6 +327,16 @@ spec:
               run_psql_with_retry "set search_path ${USER_RO}" \
                 psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 \
                   -c "ALTER ROLE ${USER_RO} SET search_path = ${SCHEMA_SEARCH_PATH};"
+              run_psql_with_retry "set search_path ${USER_OPERATION_WORKER_RO}" \
+                psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 \
+                  -c "ALTER ROLE ${USER_OPERATION_WORKER_RO} SET search_path = ${SCHEMA_SEARCH_PATH};"
+
+              OPERATION_TABLE_EXISTS="$(psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -Atc "SELECT to_regclass('graphql.client_async_messages') IS NOT NULL" || true)"
+              if [ "${OPERATION_TABLE_EXISTS:-}" = "t" ]; then
+                run_psql_with_retry "grant operation worker cancellation probe" \
+                  psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 \
+                    -c "REVOKE ALL PRIVILEGES ON TABLE graphql.client_async_messages FROM ${USER_OPERATION_WORKER_RO}; GRANT SELECT (request_id, status, cancel_requested_at) ON TABLE graphql.client_async_messages TO ${USER_OPERATION_WORKER_RO};"
+              fi
 
               if vault kv get -format=json "${YSQL_SU_KV_PATH}" >/dev/null 2>&1; then
                 echo "Superuser takeover enabled via ${YSQL_SU_KV_PATH}"
@@ -346,14 +375,12 @@ spec:
                 vault secrets enable -path="${DB_MOUNT}" database
               fi
 
-              if ! vault read -format=json "${DB_MOUNT}/config/${DB_NAME_IN_VAULT}" >/dev/null 2>&1; then
-                vault write "${DB_MOUNT}/config/${DB_NAME_IN_VAULT}" \
-                  plugin_name="postgresql-database-plugin" \
-                  allowed_roles="${ROLE_STATIC_ADMIN},${ROLE_STATIC_RO}" \
-                  connection_url="postgresql://{{username}}:{{password}}@${PGHOST}:${PGPORT}/${ADMIN_DB}?sslmode=${YSQL_SSLMODE}" \
-                  username="${VAULTADMIN_USER}" \
-                  password="${VAULTADMIN_PASS}"
-              fi
+              vault write "${DB_MOUNT}/config/${DB_NAME_IN_VAULT}" \
+                plugin_name="postgresql-database-plugin" \
+                allowed_roles="${ROLE_STATIC_ADMIN},${ROLE_STATIC_RO},${ROLE_STATIC_OPERATION_WORKER_RO}" \
+                connection_url="postgresql://{{username}}:{{password}}@${PGHOST}:${PGPORT}/${ADMIN_DB}?sslmode=${YSQL_SSLMODE}" \
+                username="${VAULTADMIN_USER}" \
+                password="${VAULTADMIN_PASS}"
 
               vault write "${DB_MOUNT}/static-roles/${ROLE_STATIC_ADMIN}" \
                 db_name="${DB_NAME_IN_VAULT}" \
@@ -367,14 +394,24 @@ spec:
                 rotation_period="24h" \
                 rotation_statements="ALTER ROLE \"${USER_RO}\" WITH PASSWORD '{{password}}';"
 
+              vault write "${DB_MOUNT}/static-roles/${ROLE_STATIC_OPERATION_WORKER_RO}" \
+                db_name="${DB_NAME_IN_VAULT}" \
+                username="${USER_OPERATION_WORKER_RO}" \
+                rotation_period="24h" \
+                rotation_statements="ALTER ROLE \"${USER_OPERATION_WORKER_RO}\" WITH PASSWORD '{{password}}';"
+
               run_vault_rotate_with_retry "${ROLE_STATIC_ADMIN}"
               run_vault_rotate_with_retry "${ROLE_STATIC_RO}"
+              run_vault_rotate_with_retry "${ROLE_STATIC_OPERATION_WORKER_RO}"
 
               vault policy write "${ROLE_STATIC_ADMIN}" - <<EOF
               path "${DB_MOUNT}/static-creds/${ROLE_STATIC_ADMIN}" { capabilities = ["read"] }
               EOF
               vault policy write "${ROLE_STATIC_RO}" - <<EOF
               path "${DB_MOUNT}/static-creds/${ROLE_STATIC_RO}" { capabilities = ["read"] }
+              EOF
+              vault policy write "${ROLE_STATIC_OPERATION_WORKER_RO}" - <<EOF
+              path "${DB_MOUNT}/static-creds/${ROLE_STATIC_OPERATION_WORKER_RO}" { capabilities = ["read"] }
               EOF
 
               vault policy write "externalsecrets-graphql" - <<'EOF'
@@ -457,7 +494,7 @@ spec:
               vault write auth/${AUTH_PATH}/role/graphql-operation-test-worker \
                 bound_service_account_names="graphql-operation-test-worker" \
                 bound_service_account_namespaces="graphql" \
-                policies="graphql-operation-test-worker,${ROLE_STATIC_RO}" \
+                policies="graphql-operation-test-worker,${ROLE_STATIC_OPERATION_WORKER_RO}" \
                 ttl="48h"
 
               vault write auth/${AUTH_PATH}/role/graphql-async-cleanup \

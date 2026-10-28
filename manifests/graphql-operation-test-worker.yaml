@@ -311,9 +311,9 @@ spec:
           {{- with secret "secret/data/graphql-kafka-async-password" -}}
           {{ .Data.data.value }}
           {{- end }}
-        vault.hashicorp.com/agent-inject-secret-db-url: "yugabyte-db/static-creds/graphql-yb-ro"
+        vault.hashicorp.com/agent-inject-secret-db-url: "yugabyte-db/static-creds/graphql-operation-test-worker-yb-ro"
         vault.hashicorp.com/agent-inject-template-db-url: |
-          {{- with secret "yugabyte-db/static-creds/graphql-yb-ro" -}}
+          {{- with secret "yugabyte-db/static-creds/graphql-operation-test-worker-yb-ro" -}}
           postgresql://{{ .Data.username }}:{{ .Data.password }}@yb-tserver-service.yugabyte.svc.cluster.local:5433/hasura?sslmode=disable
           {{- end }}
     spec:

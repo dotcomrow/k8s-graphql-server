@@ -242,8 +242,19 @@ spec:
                 END IF;
                 IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'graphql_ro') THEN
                   GRANT USAGE ON SCHEMA graphql TO graphql_ro;
+                  REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER
+                    ON TABLE graphql.client_async_messages
+                    FROM graphql_ro;
                   GRANT SELECT ON TABLE graphql.client_async_messages TO graphql_ro;
-                  GRANT USAGE, SELECT ON SEQUENCE graphql.client_async_messages_id_seq TO graphql_ro;
+                  REVOKE UPDATE, USAGE ON SEQUENCE graphql.client_async_messages_id_seq FROM graphql_ro;
+                  GRANT SELECT ON SEQUENCE graphql.client_async_messages_id_seq TO graphql_ro;
+                END IF;
+                IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'graphql_operation_test_worker_ro') THEN
+                  GRANT USAGE ON SCHEMA graphql TO graphql_operation_test_worker_ro;
+                  REVOKE ALL PRIVILEGES ON TABLE graphql.client_async_messages FROM graphql_operation_test_worker_ro;
+                  GRANT SELECT (request_id, status, cancel_requested_at)
+                    ON TABLE graphql.client_async_messages
+                    TO graphql_operation_test_worker_ro;
                 END IF;
               END;
               $$$$;
@@ -296,11 +307,10 @@ spec:
                   role: $role,
                   permission: {
                     columns: [
-                      "id", "request_id", "client_id", "status", "request_payload", "response_payload",
-                      "error_payload", "kafka_topic", "kafka_partition", "kafka_offset", "metadata",
+                      "request_id", "client_id", "status", "request_payload", "response_payload",
+                      "error_payload", "metadata",
                       "created_at", "updated_at", "completed_at", "expires_at", "operation_type",
-                      "operation_version", "handler", "operation", "priority", "not_before",
-                      "request_kafka_topic", "request_kafka_partition", "request_kafka_offset",
+                      "operation_version", "priority", "not_before",
                       "attempt_count", "max_attempts", "cancel_requested_at", "leased_at", "started_at",
                       "next_attempt_at"
                     ],
@@ -314,20 +324,16 @@ spec:
               }')"
               metadata_post "${USER_SELECT_PAYLOAD}"
 
-              if ! permission_exists "${ASYNC_CLIENT_ROLE}" "insert_permissions"; then
-                USER_INSERT_PAYLOAD="$(jq -n --arg source "${SOURCE_NAME}" --arg role "${ASYNC_CLIENT_ROLE}" '{
-                  type: "pg_create_insert_permission",
+              if permission_exists "${ASYNC_CLIENT_ROLE}" "insert_permissions"; then
+                USER_DROP_INSERT_PAYLOAD="$(jq -n --arg source "${SOURCE_NAME}" --arg role "${ASYNC_CLIENT_ROLE}" '{
+                  type: "pg_drop_insert_permission",
                   args: {
                     source: $source,
                     table: { schema: "graphql", name: "client_async_messages" },
-                    role: $role,
-                    permission: {
-                      columns: ["request_id", "client_id", "request_payload", "metadata", "kafka_topic", "expires_at"],
-                      check: { client_id: { _eq: "X-Hasura-User-Id" } }
-                    }
+                    role: $role
                   }
                 }')"
-                metadata_post "${USER_INSERT_PAYLOAD}"
+                metadata_post "${USER_DROP_INSERT_PAYLOAD}"
               fi
 
               if permission_exists "${ASYNC_SERVICE_ROLE}" "select_permissions"; then

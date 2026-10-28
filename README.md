@@ -141,10 +141,12 @@ Cancellation after a worker starts is cooperative; a worker must implement that 
 MFE advertises the operation as cancelable.
 
 The platform test worker demonstrates that requirement by polling only the authoritative operation
-status with a dedicated `graphql_ro` database credential while delayed work is active. Production
-workers may use another cooperative cancellation transport, but a late result must never overwrite
-an acknowledged cancellation. Request and response Kafka transport coordinates are stored in
-separate columns, so response ingestion cannot redirect a retry into the response topic.
+status with the dedicated `graphql_operation_test_worker_ro` database credential while delayed work
+is active. That role can select only `request_id`, `status`, and `cancel_requested_at` from the
+operation table. Production workers may use another cooperative cancellation transport, but a late
+result must never overwrite an acknowledged cancellation. Request and response Kafka transport
+coordinates are stored in separate columns and are not exposed through the application-user Hasura
+role, so transport details remain an infrastructure concern.
 
 Execution expiry and historical retention are deliberately separate. The expiry job marks state
 but does not delete terminal records. A retention policy must preserve results long enough for

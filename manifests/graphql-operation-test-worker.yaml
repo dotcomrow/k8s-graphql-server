@@ -193,7 +193,8 @@ data:
       finally:
         producer.flush(timeout=10)
         producer.close(timeout=10)
-        consumer.close(timeout=10)
+        # kafka-python 2.3.x removed the timeout keyword from consumer.close().
+        consumer.close()
 
     if __name__ == "__main__":
       main()

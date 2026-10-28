@@ -84,7 +84,7 @@ data:
         metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
           'request_published', true,
           'request_published_at', NOW(),
-          'outbox_relay', %s
+          'outbox_relay', %s::text
         ),
         updated_at = NOW()
     WHERE request_id = %s AND status IN ('accepted', 'pending', 'queued', 'scheduled', 'retry-scheduled')
@@ -104,7 +104,7 @@ data:
     SET status = 'dead-lettered',
         error_payload = jsonb_build_object(
           'code', 'OUTBOX_PUBLISH_FAILED',
-          'message', %s,
+          'message', %s::text,
           'retryable', true
         ),
         completed_at = NOW(), updated_at = NOW()

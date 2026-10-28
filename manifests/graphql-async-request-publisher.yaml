@@ -45,6 +45,7 @@ data:
       status,
       request_payload,
       kafka_topic,
+      request_kafka_topic,
       metadata,
       expires_at,
       operation_type,
@@ -59,6 +60,7 @@ data:
       %s,
       'queued',
       %s::jsonb,
+      %s,
       %s,
       %s::jsonb,
       %s::timestamptz,
@@ -131,7 +133,7 @@ data:
     """
 
     RETRY_SELECT_SQL = """
-    SELECT request_payload, kafka_topic, attempt_count, max_attempts, expires_at
+    SELECT request_payload, request_kafka_topic, attempt_count, max_attempts, expires_at
     FROM graphql.client_async_messages
     WHERE request_id = %s AND client_id = %s
     FOR UPDATE
@@ -587,6 +589,7 @@ data:
               request_id,
               client_id,
               request_payload,
+              KAFKA_RESPONSE_TOPIC,
               KAFKA_REQUEST_TOPIC,
               metadata,
               expires_at,
@@ -663,7 +666,7 @@ data:
           row = cur.fetchone()
           if not row:
             raise RequestError(404, "operation was not found")
-          request_payload, kafka_topic, attempt_count, max_attempts, expires_at = row
+          request_payload, request_kafka_topic, attempt_count, max_attempts, expires_at = row
           if int(attempt_count or 0) + 1 >= int(max_attempts or 1):
             raise RequestError(409, "operation retry limit has been reached")
           if expires_at is not None and expires_at <= utc_now():
@@ -680,7 +683,7 @@ data:
             INSERT_OUTBOX_SQL,
             (
               operation_id,
-              str(kafka_topic or KAFKA_REQUEST_TOPIC),
+              str(request_kafka_topic or KAFKA_REQUEST_TOPIC),
               operation_id,
               json.dumps(request_payload, separators=(",", ":"), ensure_ascii=False),
               None,

@@ -163,6 +163,9 @@ spec:
                 ADD COLUMN IF NOT EXISTS operation TEXT,
                 ADD COLUMN IF NOT EXISTS priority TEXT NOT NULL DEFAULT 'normal',
                 ADD COLUMN IF NOT EXISTS not_before TIMESTAMPTZ,
+                ADD COLUMN IF NOT EXISTS request_kafka_topic TEXT NOT NULL DEFAULT 'graphql.async.requests.v1',
+                ADD COLUMN IF NOT EXISTS request_kafka_partition INTEGER,
+                ADD COLUMN IF NOT EXISTS request_kafka_offset BIGINT,
                 ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0,
                 ADD COLUMN IF NOT EXISTS max_attempts INTEGER NOT NULL DEFAULT 1,
                 ADD COLUMN IF NOT EXISTS cancel_requested_at TIMESTAMPTZ,
@@ -297,6 +300,7 @@ spec:
                       "error_payload", "kafka_topic", "kafka_partition", "kafka_offset", "metadata",
                       "created_at", "updated_at", "completed_at", "expires_at", "operation_type",
                       "operation_version", "handler", "operation", "priority", "not_before",
+                      "request_kafka_topic", "request_kafka_partition", "request_kafka_offset",
                       "attempt_count", "max_attempts", "cancel_requested_at", "leased_at", "started_at",
                       "next_attempt_at"
                     ],
@@ -350,6 +354,7 @@ spec:
                       "error_payload", "kafka_topic", "kafka_partition", "kafka_offset", "metadata",
                       "created_at", "updated_at", "completed_at", "expires_at", "operation_type",
                       "operation_version", "handler", "operation", "priority", "not_before",
+                      "request_kafka_topic", "request_kafka_partition", "request_kafka_offset",
                       "attempt_count", "max_attempts", "cancel_requested_at", "leased_at", "started_at",
                       "next_attempt_at"
                     ],

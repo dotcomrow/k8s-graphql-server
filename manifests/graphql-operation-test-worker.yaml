@@ -1,4 +1,10 @@
 apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: graphql-operation-test-worker
+  namespace: graphql
+---
+apiVersion: v1
 kind: ConfigMap
 metadata:
   name: graphql-operation-test-worker
@@ -14,6 +20,7 @@ data:
     import traceback
     from datetime import datetime, timezone
 
+    import psycopg
     from kafka import KafkaConsumer, KafkaProducer
     from kafka.structs import OffsetAndMetadata, TopicPartition
 
@@ -29,6 +36,8 @@ data:
     ]
     KAFKA_USERNAME_PATH = os.environ.get("KAFKA_USERNAME_PATH", "/vault/secrets/kafka-async-username")
     KAFKA_PASSWORD_PATH = os.environ.get("KAFKA_PASSWORD_PATH", "/vault/secrets/kafka-async-password")
+    DB_URL_PATH = os.environ.get("DB_URL_PATH", "/vault/secrets/db-url")
+    CANCEL_POLL_SECONDS = max(0.1, min(float(os.environ.get("CANCEL_POLL_SECONDS", "0.25")), 5.0))
     HEARTBEAT_PATH = os.environ.get("HEARTBEAT_PATH", "/tmp/health/heartbeat")
     RUNNING = True
 
@@ -77,7 +86,7 @@ data:
         "metadata": {**metadata, "worker": WORKER_ID, "handler": HANDLER},
         **extra,
       }
-      if status in ("succeeded", "failed"):
+      if status in ("succeeded", "failed", "cancelled"):
         message["completed_at"] = iso_now()
       producer.send(
         reply_topic,
@@ -93,7 +102,65 @@ data:
         offset = OffsetAndMetadata(record.offset + 1, "")
       consumer.commit({partition: offset})
 
-    def handle(producer, record):
+    class CancellationProbe:
+      def __init__(self, db_url):
+        self.db_url = db_url
+        self.connection = None
+
+      def close(self):
+        if self.connection is not None:
+          try:
+            self.connection.close()
+          except Exception:
+            pass
+        self.connection = None
+
+      def requested(self, request_id):
+        for attempt in range(2):
+          try:
+            if self.connection is None or self.connection.closed:
+              self.connection = psycopg.connect(
+                self.db_url,
+                connect_timeout=10,
+                autocommit=True,
+              )
+            with self.connection.cursor() as cur:
+              cur.execute(
+                """
+                SELECT status, cancel_requested_at
+                FROM graphql.client_async_messages
+                WHERE request_id = %s
+                """,
+                (request_id,),
+              )
+              row = cur.fetchone()
+            return bool(row) and (
+              row[1] is not None
+              or str(row[0]) in ("cancel-requested", "cancelled", "expired")
+            )
+          except psycopg.Error:
+            self.close()
+            if attempt > 0:
+              raise
+        return False
+
+    def publish_cancelled(producer, request_id, client_id, metadata, reply_topic):
+      publish(
+        producer,
+        request_id,
+        client_id,
+        "cancelled",
+        metadata,
+        reply_topic,
+        progress={
+          "sequence": 2,
+          "percent": 100,
+          "message": "Operation cancellation acknowledged by test worker",
+          "updated_at": iso_now(),
+        },
+      )
+
+    def handle(producer, cancellation_probe, record):
       envelope = json.loads(record.value.decode("utf-8"))
       if not isinstance(envelope, dict):
         raise ValueError("request envelope must be an object")
@@ -107,6 +174,10 @@ data:
       options = envelope.get("options") if isinstance(envelope.get("options"), dict) else {}
       metadata = envelope.get("metadata") if isinstance(envelope.get("metadata"), dict) else {}
       reply_topic = str(options.get("reply_topic") or RESPONSE_TOPIC).strip() or RESPONSE_TOPIC
+
+      if cancellation_probe.requested(request_id):
+        publish_cancelled(producer, request_id, client_id, metadata, reply_topic)
+        return
 
       publish(
         producer,
@@ -122,7 +193,13 @@ data:
         result = {"echo": payload, "handled_at": iso_now(), "worker": WORKER_ID}
       elif operation == "delay":
         delay_seconds = max(0.0, min(float(payload.get("delay_seconds", 1)), 30.0))
-        time.sleep(delay_seconds)
+        deadline = time.monotonic() + delay_seconds
+        while RUNNING and time.monotonic() < deadline:
+          heartbeat()
+          time.sleep(min(CANCEL_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+          if cancellation_probe.requested(request_id):
+            publish_cancelled(producer, request_id, client_id, metadata, reply_topic)
+            return
         result = {"delay_seconds": delay_seconds, "payload": payload.get("value"), "handled_at": iso_now()}
       elif operation == "fail":
         raise RuntimeError(str(payload.get("message") or "requested test failure"))
@@ -145,6 +222,8 @@ data:
       signal.signal(signal.SIGINT, signal_handler)
       username = read_secret(KAFKA_USERNAME_PATH, "Kafka username")
       password = read_secret(KAFKA_PASSWORD_PATH, "Kafka password")
+      db_url = read_secret(DB_URL_PATH, "database URL")
+      cancellation_probe = CancellationProbe(db_url)
       common = kafka_config(username, password)
       consumer = KafkaConsumer(
         REQUEST_TOPIC,
@@ -166,7 +245,7 @@ data:
               envelope = {}
               try:
                 envelope = json.loads(record.value.decode("utf-8"))
-                handle(producer, record)
+                handle(producer, cancellation_probe, record)
                 commit(consumer, record)
               except Exception as exc:
                 traceback.print_exc()
@@ -191,6 +270,7 @@ data:
                 )
                 commit(consumer, record)
       finally:
+        cancellation_probe.close()
         producer.flush(timeout=10)
         producer.close(timeout=10)
         # kafka-python 2.3.x removed the timeout keyword from consumer.close().
@@ -220,7 +300,7 @@ spec:
         linkerd.io/inject: "disabled"
         reloader.stakater.com/auto: "true"
         vault.hashicorp.com/agent-inject: "true"
-        vault.hashicorp.com/role: "graphql-async-response-writer"
+        vault.hashicorp.com/role: "graphql-operation-test-worker"
         vault.hashicorp.com/agent-inject-secret-kafka-async-username: "secret/data/graphql-kafka-async-username"
         vault.hashicorp.com/agent-inject-template-kafka-async-username: |
           {{- with secret "secret/data/graphql-kafka-async-username" -}}
@@ -231,8 +311,13 @@ spec:
           {{- with secret "secret/data/graphql-kafka-async-password" -}}
           {{ .Data.data.value }}
           {{- end }}
+        vault.hashicorp.com/agent-inject-secret-db-url: "yugabyte-db/static-creds/graphql-yb-ro"
+        vault.hashicorp.com/agent-inject-template-db-url: |
+          {{- with secret "yugabyte-db/static-creds/graphql-yb-ro" -}}
+          postgresql://{{ .Data.username }}:{{ .Data.password }}@yb-tserver-service.yugabyte.svc.cluster.local:5433/hasura?sslmode=disable
+          {{- end }}
     spec:
-      serviceAccountName: graphql-async-response-writer
+      serviceAccountName: graphql-operation-test-worker
       containers:
         - name: worker
           image: python:3.12-slim
@@ -254,11 +339,17 @@ spec:
               value: "/vault/secrets/kafka-async-username"
             - name: KAFKA_PASSWORD_PATH
               value: "/vault/secrets/kafka-async-password"
+            - name: DB_URL_PATH
+              value: "/vault/secrets/db-url"
+            - name: CANCEL_POLL_SECONDS
+              value: "0.25"
           command: ["/bin/sh", "-ec"]
           args:
             - |
               set -euo pipefail
-              pip install --no-cache-dir --disable-pip-version-check "kafka-python>=2.0.2,<3.0.0"
+              pip install --no-cache-dir --disable-pip-version-check \
+                "kafka-python>=2.0.2,<3.0.0" \
+                "psycopg[binary]>=3.1.0,<4.0.0"
               exec python /opt/config/worker.py
           readinessProbe:
             exec:

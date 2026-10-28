@@ -80,7 +80,8 @@ data:
 
     MARK_OPERATION_PUBLISHED_SQL = """
     UPDATE graphql.client_async_messages
-    SET status = 'queued', kafka_topic = %s, kafka_partition = %s, kafka_offset = %s,
+    SET status = 'queued', request_kafka_topic = %s,
+        request_kafka_partition = %s, request_kafka_offset = %s,
         metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
           'request_published', true,
           'request_published_at', NOW(),

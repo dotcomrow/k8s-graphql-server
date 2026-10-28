@@ -48,19 +48,35 @@ data:
     UPDATE_SQL = """
     UPDATE graphql.client_async_messages
     SET
-      status = %s,
-      response_payload = COALESCE(%s::jsonb, response_payload),
-      error_payload = COALESCE(%s::jsonb, error_payload),
+      status = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled' ELSE %s END,
+      response_payload = CASE
+        WHEN cancel_requested_at IS NOT NULL THEN response_payload
+        ELSE COALESCE(%s::jsonb, response_payload)
+      END,
+      error_payload = CASE
+        WHEN cancel_requested_at IS NOT NULL THEN error_payload
+        ELSE COALESCE(%s::jsonb, error_payload)
+      END,
       kafka_topic = %s,
       kafka_partition = %s,
       kafka_offset = %s,
-      metadata = COALESCE(metadata, '{}'::jsonb) || COALESCE(%s::jsonb, '{}'::jsonb),
-      completed_at = COALESCE(%s::timestamptz, completed_at),
+      metadata = CASE
+        WHEN cancel_requested_at IS NOT NULL THEN
+          COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
+            'cancelled_after_dispatch', true,
+            'cancelled_at', NOW()
+          )
+        ELSE COALESCE(metadata, '{}'::jsonb) || COALESCE(%s::jsonb, '{}'::jsonb)
+      END,
+      completed_at = CASE
+        WHEN cancel_requested_at IS NOT NULL THEN COALESCE(completed_at, NOW())
+        ELSE COALESCE(%s::timestamptz, completed_at)
+      END,
       expires_at = COALESCE(%s::timestamptz, expires_at),
       updated_at = NOW()
     WHERE request_id = %s
       AND status NOT IN ('cancelled', 'expired')
-    RETURNING id, request_payload, kafka_topic, attempt_count, max_attempts
+    RETURNING id, request_payload, kafka_topic, attempt_count, max_attempts, status
     """
 
     SCHEDULE_RETRY_SQL = """
@@ -114,14 +130,34 @@ data:
     )
     ON CONFLICT (request_id) DO UPDATE
     SET
-      status = EXCLUDED.status,
-      response_payload = COALESCE(EXCLUDED.response_payload, graphql.client_async_messages.response_payload),
-      error_payload = COALESCE(EXCLUDED.error_payload, graphql.client_async_messages.error_payload),
+      status = CASE
+        WHEN graphql.client_async_messages.cancel_requested_at IS NOT NULL THEN 'cancelled'
+        ELSE EXCLUDED.status
+      END,
+      response_payload = CASE
+        WHEN graphql.client_async_messages.cancel_requested_at IS NOT NULL THEN graphql.client_async_messages.response_payload
+        ELSE COALESCE(EXCLUDED.response_payload, graphql.client_async_messages.response_payload)
+      END,
+      error_payload = CASE
+        WHEN graphql.client_async_messages.cancel_requested_at IS NOT NULL THEN graphql.client_async_messages.error_payload
+        ELSE COALESCE(EXCLUDED.error_payload, graphql.client_async_messages.error_payload)
+      END,
       kafka_topic = EXCLUDED.kafka_topic,
       kafka_partition = EXCLUDED.kafka_partition,
       kafka_offset = EXCLUDED.kafka_offset,
-      metadata = COALESCE(graphql.client_async_messages.metadata, '{}'::jsonb) || COALESCE(EXCLUDED.metadata, '{}'::jsonb),
-      completed_at = COALESCE(EXCLUDED.completed_at, graphql.client_async_messages.completed_at),
+      metadata = CASE
+        WHEN graphql.client_async_messages.cancel_requested_at IS NOT NULL THEN
+          COALESCE(graphql.client_async_messages.metadata, '{}'::jsonb) || jsonb_build_object(
+            'cancelled_after_dispatch', true,
+            'cancelled_at', NOW()
+          )
+        ELSE COALESCE(graphql.client_async_messages.metadata, '{}'::jsonb) || COALESCE(EXCLUDED.metadata, '{}'::jsonb)
+      END,
+      completed_at = CASE
+        WHEN graphql.client_async_messages.cancel_requested_at IS NOT NULL THEN
+          COALESCE(graphql.client_async_messages.completed_at, NOW())
+        ELSE COALESCE(EXCLUDED.completed_at, graphql.client_async_messages.completed_at)
+      END,
       expires_at = COALESCE(EXCLUDED.expires_at, graphql.client_async_messages.expires_at),
       updated_at = NOW()
     WHERE graphql.client_async_messages.status NOT IN ('cancelled', 'expired')
@@ -262,6 +298,16 @@ data:
           {"payload_preview": raw_value[:2048]},
         )
 
+      spec_version = str(payload.get("spec_version") or "").strip()
+      if spec_version and spec_version != "async.response.v1":
+        raise PermanentMessageError(
+          "unsupported_spec_version",
+          {
+            "spec_version": spec_version,
+            "request_id": str(payload.get("request_id") or decode_bytes(message.key)).strip(),
+          },
+        )
+
       request_id = str(payload.get("request_id") or decode_bytes(message.key)).strip()
       if not request_id:
         raise PermanentMessageError(
@@ -278,6 +324,11 @@ data:
         status = status.strip().lower()
       elif payload.get("error_payload") is not None or payload.get("error") is not None:
         status = "error"
+      elif spec_version == "async.response.v1":
+        raise PermanentMessageError(
+          "missing_status",
+          {"request_id": request_id},
+        )
       else:
         status = "completed"
 
@@ -344,10 +395,13 @@ data:
         )
         updated = cur.fetchone()
         if updated:
+          persisted_status = str(updated[5])
+          if persisted_status == "cancelled":
+            return "cancelled"
           retryable = isinstance(record["error_payload"], dict) and record["error_payload"].get("retryable") is True
           attempt_count = int(updated[3] or 0)
           max_attempts = max(int(updated[4] or 1), 1)
-          if record["status"] == "failed" and retryable and attempt_count + 1 < max_attempts:
+          if persisted_status == "failed" and retryable and attempt_count + 1 < max_attempts:
             backoff_seconds = min(300, (2 ** min(attempt_count, 8)) + random.uniform(0, 1))
             cur.execute(
               SCHEDULE_RETRY_SQL,

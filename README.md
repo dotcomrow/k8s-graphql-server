@@ -63,6 +63,7 @@ This repo includes idempotent bootstrap jobs for the async GraphQL + Kafka flow:
 - `manifests/graphql-operation-test-worker.yaml`
   - Provides the generic test handler `platform-test-worker`.
   - Supports `echo`, `delay`, and `fail` for end-to-end platform validation.
+  - Uses a dedicated read-only database identity to cooperatively acknowledge cancellation during delayed work.
   - Publishes progress and terminal responses without application-specific behavior.
 - `manifests/graphql-async-cleanup.yaml`
   - Runs a scheduled cleanup (`CronJob`) every 10 minutes.
@@ -138,6 +139,12 @@ mutation RetryOperation($input: json!) {
 Both actions accept `{ "operation_id": "..." }` and enforce ownership from the Hasura session.
 Cancellation after a worker starts is cooperative; a worker must implement that check before an
 MFE advertises the operation as cancelable.
+
+The platform test worker demonstrates that requirement by polling only the authoritative operation
+status with a dedicated `graphql_ro` database credential while delayed work is active. Production
+workers may use another cooperative cancellation transport, but a late result must never overwrite
+an acknowledged cancellation. Request and response Kafka transport coordinates are stored in
+separate columns, so response ingestion cannot redirect a retry into the response topic.
 
 Execution expiry and historical retention are deliberately separate. The expiry job marks state
 but does not delete terminal records. A retention policy must preserve results long enough for

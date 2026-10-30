@@ -247,56 +247,7 @@ spec:
               create_or_update_topic "${KAFKA_RESPONSE_TOPIC}" "${KAFKA_RESPONSE_PARTITIONS}" "${KAFKA_RESPONSE_RETENTION_MS}" "${KAFKA_RESPONSE_SEGMENT_MS}"
               create_or_update_topic "${KAFKA_DLQ_TOPIC}" "${KAFKA_DLQ_PARTITIONS}" "${KAFKA_DLQ_RETENTION_MS}" "${KAFKA_DLQ_SEGMENT_MS}"
 
-              echo "Ensuring SCRAM credentials for user ${KAFKA_ASYNC_USERNAME}"
-              SCRAM_OUTPUT=""
-              if ! SCRAM_OUTPUT="$(kafka_cli_retry kafka-configs.sh \
-                --alter \
-                --entity-type users \
-                --entity-name "${KAFKA_ASYNC_USERNAME}" \
-                --add-config "SCRAM-SHA-256=[iterations=${KAFKA_SCRAM_ITERATIONS},password=${KAFKA_ASYNC_PASSWORD}]" 2>&1)"; then
-                if grep -Eqi "AuthorizationException|Not authorized|ClusterAuthorizationException" <<<"${SCRAM_OUTPUT}"; then
-                  echo "Configured Kafka principal cannot alter user SCRAM credentials; skipping credential alter"
-                else
-                  echo "${SCRAM_OUTPUT}" >&2
-                  exit 1
-                fi
-              fi
-
-              kafka_cli kafka-configs.sh \
-                --describe \
-                --entity-type users \
-                --entity-name "${KAFKA_ASYNC_USERNAME}" >/dev/null 2>&1 || true
-
-              ACL_LIST_OUTPUT=""
-              if ACL_LIST_OUTPUT="$(kafka_cli_retry kafka-acls.sh --list 2>&1)"; then
-                ACLS_ENABLED="true"
-              elif grep -q "SecurityDisabledException" <<<"${ACL_LIST_OUTPUT}"; then
-                ACLS_ENABLED="false"
-                echo "Kafka authorizer is disabled; skipping ACL creation"
-              elif grep -Eqi "AuthorizationException|Not authorized|ClusterAuthorizationException|TopicAuthorizationException|GroupAuthorizationException" <<<"${ACL_LIST_OUTPUT}"; then
-                ACLS_ENABLED="false"
-                echo "Configured Kafka principal cannot manage ACLs; skipping ACL creation"
-              else
-                echo "Failed to list ACLs" >&2
-                echo "${ACL_LIST_OUTPUT}" >&2
-                exit 1
-              fi
-
-              if [[ "${ACLS_ENABLED}" == "true" ]]; then
-                add_acl() {
-                  kafka_cli_retry kafka-acls.sh \
-                    --add \
-                    --allow-principal "User:${KAFKA_ASYNC_USERNAME}" \
-                    "$@"
-                }
-
-                add_acl --topic "${KAFKA_REQUEST_TOPIC}" --operation Read --operation Write --operation Describe
-                add_acl --topic "${KAFKA_RESPONSE_TOPIC}" --operation Read --operation Write --operation Describe
-                add_acl --topic "${KAFKA_DLQ_TOPIC}" --operation Read --operation Write --operation Describe
-                add_acl --group "${KAFKA_CONSUMER_GROUP}" --operation Read --operation Describe
-                add_acl --group "${KAFKA_RESPONSE_CONSUMER_GROUP}" --operation Read --operation Describe
-                add_acl --resource-pattern-type prefixed --group "${KAFKA_OPERATION_GROUP_PREFIX}" --operation Read --operation Describe
-                kafka_cli_retry kafka-acls.sh --list
-              fi
-
-              echo "Kafka async setup complete"
+              # SCRAM credentials and ACLs are reconciled centrally by the
+              # k8s-kafka security manifests. This application principal owns
+              # its data topics, but must never administer cluster security.
+              echo "Kafka async topic setup complete; security is centrally reconciled"

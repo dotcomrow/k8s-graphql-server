@@ -173,6 +173,27 @@ The platform test worker accepts this route:
 It also supports `delay` with `delay_seconds` capped at 30 seconds and `fail` for testing failure
 delivery.
 
+### Platform operation handler
+
+`graphql-platform-operation-worker` is the allowlisted reference adapter for durable cross-service
+commands. It consumes `graphql.async.requests.v1` as consumer group
+`graphql-operation-platform-worker-v1`, accepts only handler `platform-operation-worker`, and
+publishes progress and terminal results to `graphql.async.responses.v1`.
+
+Supported routes are:
+
+- `platform.app.deploy` and `platform.app.destroy`, which queue the existing platform-deploy
+  workflow and return its authoritative downstream operation identifier;
+- `platform.notification.queue`, which validates and queues a request into the existing
+  channel-specific notification Kafka flow;
+- `platform.runtime-canary.run`, which executes one named runtime canary and returns its run and
+  step detail.
+
+The worker is deliberately not a generic HTTP proxy. Every route has a fixed target and payload
+adapter, uses a dedicated Vault-injected service credential, and carries no end-user token on
+Kafka. Add new platform commands as explicit routes with manifest schemas and Gravitee async-role
+policy rather than accepting caller-provided URLs.
+
 ### Async Route Authorization (Annotation-Driven)
 
 `publish_async_request` remains a generic carrier. Route-level authorization is enforced by

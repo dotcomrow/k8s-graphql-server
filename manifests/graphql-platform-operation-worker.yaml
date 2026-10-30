@@ -1,0 +1,357 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: graphql-platform-operation-worker
+  namespace: graphql
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: graphql-platform-operation-worker
+  namespace: graphql
+data:
+  worker.py: |
+    #!/usr/bin/env python3
+    import json
+    import os
+    import signal
+    import socket
+    import time
+    import traceback
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    from datetime import datetime, timezone
+
+    from kafka import KafkaConsumer, KafkaProducer
+    from kafka.structs import OffsetAndMetadata, TopicPartition
+
+    REQUEST_TOPIC = os.environ.get("REQUEST_TOPIC", "graphql.async.requests.v1").strip()
+    RESPONSE_TOPIC = os.environ.get("RESPONSE_TOPIC", "graphql.async.responses.v1").strip()
+    CONSUMER_GROUP = os.environ.get("CONSUMER_GROUP", "graphql-operation-platform-worker-v1").strip()
+    HANDLER = os.environ.get("HANDLER", "platform-operation-worker").strip().lower()
+    WORKER_ID = socket.gethostname()
+    HEARTBEAT_PATH = "/tmp/health/heartbeat"
+    KAFKA_BOOTSTRAP_SERVERS = [item.strip() for item in os.environ.get(
+      "KAFKA_BOOTSTRAP_SERVERS", "kafka.kafka.svc.internal.lan:9092"
+    ).split(",") if item.strip()]
+    KAFKA_USERNAME_PATH = "/vault/secrets/kafka-async-username"
+    KAFKA_PASSWORD_PATH = "/vault/secrets/kafka-async-password"
+    PLATFORM_DEPLOY_TOKEN_PATH = "/vault/secrets/platform-deploy-token"
+    PLATFORM_NOTIFICATION_TOKEN_PATH = "/vault/secrets/platform-notification-token"
+    RUNTIME_STATUS_TOKEN_PATH = "/vault/secrets/runtime-status-token"
+    PLATFORM_DEPLOY_URL = os.environ.get(
+      "PLATFORM_DEPLOY_URL", "http://platform-deploy-service.directus.svc.cluster.local:8080"
+    ).rstrip("/")
+    PLATFORM_NOTIFICATION_URL = os.environ.get(
+      "PLATFORM_NOTIFICATION_URL", "http://platform-notification-service.directus.svc.cluster.local:8080"
+    ).rstrip("/")
+    RUNTIME_STATUS_URL = os.environ.get(
+      "RUNTIME_STATUS_URL", "http://runtime-status-service.directus.svc.cluster.local:8080"
+    ).rstrip("/")
+    RUNNING = True
+
+    class OperationError(Exception):
+      def __init__(self, code, message, retryable=False, details=None):
+        super().__init__(message)
+        self.code = code
+        self.retryable = retryable
+        self.details = details or {}
+
+    def iso_now():
+      return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def log(message):
+      print(f"[{iso_now()}] {message}", flush=True)
+
+    def signal_handler(signum, _frame):
+      global RUNNING
+      RUNNING = False
+      log(f"Received signal {signum}, shutting down")
+
+    def read_secret(path, label):
+      while RUNNING and (not os.path.isfile(path) or os.path.getsize(path) == 0):
+        time.sleep(2)
+      if not RUNNING:
+        raise RuntimeError(f"stopped while waiting for {label}")
+      with open(path, "r", encoding="utf-8") as handle:
+        value = handle.read().strip()
+      if not value:
+        raise RuntimeError(f"{label} is empty")
+      return value
+
+    def heartbeat():
+      os.makedirs(os.path.dirname(HEARTBEAT_PATH), exist_ok=True)
+      with open(HEARTBEAT_PATH, "w", encoding="utf-8") as handle:
+        handle.write(str(time.time()))
+
+    def kafka_config(username, password):
+      return {
+        "bootstrap_servers": KAFKA_BOOTSTRAP_SERVERS,
+        "security_protocol": "SASL_PLAINTEXT",
+        "sasl_mechanism": "SCRAM-SHA-256",
+        "sasl_plain_username": username,
+        "sasl_plain_password": password,
+      }
+
+    def publish(producer, request_id, client_id, status, metadata, reply_topic, **extra):
+      message = {
+        "spec_version": "async.response.v1",
+        "request_id": request_id,
+        "client_id": client_id,
+        "status": status,
+        "metadata": {**metadata, "worker": WORKER_ID, "handler": HANDLER},
+        **extra,
+      }
+      if status in ("succeeded", "failed", "cancelled"):
+        message["completed_at"] = iso_now()
+      producer.send(
+        reply_topic,
+        key=request_id.encode("utf-8"),
+        value=json.dumps(message, separators=(",", ":"), ensure_ascii=False).encode("utf-8"),
+      ).get(timeout=20)
+
+    def commit(consumer, record):
+      partition = TopicPartition(record.topic, record.partition)
+      try:
+        offset = OffsetAndMetadata(record.offset + 1, "", -1)
+      except TypeError:
+        offset = OffsetAndMetadata(record.offset + 1, "")
+      consumer.commit({partition: offset})
+
+    def http_json(url, token, payload, timeout_seconds):
+      request = urllib.request.Request(
+        url,
+        data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+        headers={
+          "Authorization": f"Bearer {token}",
+          "Content-Type": "application/json",
+          "Accept": "application/json",
+        },
+        method="POST",
+      )
+      try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+          body = response.read().decode("utf-8")
+          return json.loads(body or "{}")
+      except urllib.error.HTTPError as error:
+        body = error.read().decode("utf-8", errors="replace")[:2000]
+        raise OperationError(
+          "PLATFORM_SERVICE_REJECTED",
+          f"{url} returned HTTP {error.code}: {body}",
+          retryable=error.code >= 500 or error.code == 429,
+          details={"status": error.code},
+        ) from error
+      except (urllib.error.URLError, TimeoutError) as error:
+        raise OperationError("PLATFORM_SERVICE_UNAVAILABLE", str(error), retryable=True) from error
+
+    def dispatch(operation, payload, request_id, tokens):
+      if operation in ("platform.app.deploy", "platform.app.destroy"):
+        app_id = str(payload.get("app_id") or "").strip()
+        if not app_id:
+          raise OperationError("INVALID_PLATFORM_APP", "app_id is required")
+        action = "destroy" if operation.endswith("destroy") else "deploy"
+        body = {
+          "operation_type": payload.get("operation_type") or ("destroy" if action == "destroy" else "update"),
+          "notification_context": payload.get("notification_context"),
+        }
+        return http_json(
+          f"{PLATFORM_DEPLOY_URL}/internal/apps/{urllib.parse.quote(app_id, safe='')}/{action}",
+          tokens["deploy"],
+          body,
+          120,
+        )
+      if operation == "platform.notification.queue":
+        body = {**payload}
+        body["idempotency_key"] = str(body.get("idempotency_key") or request_id)
+        body["correlation_id"] = str(body.get("correlation_id") or request_id)
+        return http_json(
+          f"{PLATFORM_NOTIFICATION_URL}/internal/notifications",
+          tokens["notification"],
+          body,
+          60,
+        )
+      if operation == "platform.runtime-canary.run":
+        definition_key = str(payload.get("definition_key") or "").strip()
+        if not definition_key:
+          raise OperationError("INVALID_RUNTIME_CANARY", "definition_key is required")
+        response = http_json(
+          f"{RUNTIME_STATUS_URL}/internal/canaries/run",
+          tokens["runtime"],
+          {
+            "definition_key": definition_key,
+            "source": str(payload.get("source") or "manual"),
+            "request_id": str(payload.get("request_id") or request_id),
+          },
+          180,
+        )
+        results = response.get("results") if isinstance(response, dict) else None
+        if isinstance(results, list) and len(results) == 1 and isinstance(results[0], dict):
+          return {**results[0], "request_id": response.get("request_id")}
+        return response
+      raise OperationError("UNSUPPORTED_PLATFORM_OPERATION", f"unsupported operation: {operation}")
+
+    def handle(producer, record, tokens):
+      envelope = json.loads(record.value.decode("utf-8"))
+      if not isinstance(envelope, dict):
+        raise ValueError("request envelope must be an object")
+      route = envelope.get("route") if isinstance(envelope.get("route"), dict) else {}
+      if str(route.get("handler") or "").strip().lower() != HANDLER:
+        return
+      operation = str(route.get("operation") or "").strip().lower()
+      request_id = str(envelope.get("request_id") or record.key.decode("utf-8")).strip()
+      client_id = str(envelope.get("client_id") or "").strip()
+      payload = envelope.get("payload") if isinstance(envelope.get("payload"), dict) else {}
+      options = envelope.get("options") if isinstance(envelope.get("options"), dict) else {}
+      metadata = envelope.get("metadata") if isinstance(envelope.get("metadata"), dict) else {}
+      reply_topic = str(options.get("reply_topic") or RESPONSE_TOPIC).strip() or RESPONSE_TOPIC
+      publish(
+        producer, request_id, client_id, "running", metadata, reply_topic,
+        progress={"sequence": 1, "percent": 10, "phase": "dispatch", "message": f"Dispatching {operation}", "updated_at": iso_now()},
+      )
+      result = dispatch(operation, payload, request_id, tokens)
+      publish(
+        producer, request_id, client_id, "succeeded", metadata, reply_topic,
+        progress={"sequence": 2, "percent": 100, "phase": "accepted", "message": "Platform service accepted the command", "updated_at": iso_now()},
+        response_payload=result,
+      )
+
+    def main():
+      signal.signal(signal.SIGTERM, signal_handler)
+      signal.signal(signal.SIGINT, signal_handler)
+      username = read_secret(KAFKA_USERNAME_PATH, "Kafka username")
+      password = read_secret(KAFKA_PASSWORD_PATH, "Kafka password")
+      tokens = {
+        "deploy": read_secret(PLATFORM_DEPLOY_TOKEN_PATH, "platform deploy token"),
+        "notification": read_secret(PLATFORM_NOTIFICATION_TOKEN_PATH, "platform notification token"),
+        "runtime": read_secret(RUNTIME_STATUS_TOKEN_PATH, "runtime status token"),
+      }
+      common = kafka_config(username, password)
+      consumer = KafkaConsumer(
+        REQUEST_TOPIC,
+        group_id=CONSUMER_GROUP,
+        enable_auto_commit=False,
+        auto_offset_reset="latest",
+        consumer_timeout_ms=1000,
+        max_poll_records=4,
+        max_poll_interval_ms=600000,
+        **common,
+      )
+      producer = KafkaProducer(acks="all", retries=10, **common)
+      log(f"Platform operation worker started handler={HANDLER} group={CONSUMER_GROUP}")
+      try:
+        while RUNNING:
+          heartbeat()
+          batches = consumer.poll(timeout_ms=1000, max_records=4)
+          for records in batches.values():
+            for record in records:
+              envelope = {}
+              try:
+                envelope = json.loads(record.value.decode("utf-8"))
+                handle(producer, record, tokens)
+                commit(consumer, record)
+              except Exception as error:
+                traceback.print_exc()
+                route = envelope.get("route") if isinstance(envelope, dict) and isinstance(envelope.get("route"), dict) else {}
+                if str(route.get("handler") or "").strip().lower() != HANDLER:
+                  commit(consumer, record)
+                  continue
+                request_id = str(envelope.get("request_id") or "").strip()
+                if request_id:
+                  options = envelope.get("options") if isinstance(envelope.get("options"), dict) else {}
+                  metadata = envelope.get("metadata") if isinstance(envelope.get("metadata"), dict) else {}
+                  code = error.code if isinstance(error, OperationError) else "PLATFORM_OPERATION_FAILED"
+                  retryable = error.retryable if isinstance(error, OperationError) else True
+                  details = error.details if isinstance(error, OperationError) else {}
+                  publish(
+                    producer,
+                    request_id,
+                    str(envelope.get("client_id") or ""),
+                    "failed",
+                    metadata,
+                    str(options.get("reply_topic") or RESPONSE_TOPIC),
+                    error_payload={"code": code, "message": str(error), "retryable": retryable, "details": details},
+                  )
+                commit(consumer, record)
+      finally:
+        producer.flush(timeout=10)
+        producer.close(timeout=10)
+        consumer.close()
+
+    if __name__ == "__main__":
+      main()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: graphql-platform-operation-worker
+  namespace: graphql
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: graphql-platform-operation-worker
+  template:
+    metadata:
+      labels:
+        app: graphql-platform-operation-worker
+      annotations:
+        linkerd.io/inject: "disabled"
+        reloader.stakater.com/auto: "true"
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "graphql-platform-operation-worker"
+        vault.hashicorp.com/agent-inject-secret-kafka-async-username: "secret/data/graphql-kafka-async-username"
+        vault.hashicorp.com/agent-inject-template-kafka-async-username: |
+          {{- with secret "secret/data/graphql-kafka-async-username" -}}{{ .Data.data.value }}{{- end }}
+        vault.hashicorp.com/agent-inject-secret-kafka-async-password: "secret/data/graphql-kafka-async-password"
+        vault.hashicorp.com/agent-inject-template-kafka-async-password: |
+          {{- with secret "secret/data/graphql-kafka-async-password" -}}{{ .Data.data.value }}{{- end }}
+        vault.hashicorp.com/agent-inject-secret-platform-deploy-token: "secret/data/platform-deploy-service"
+        vault.hashicorp.com/agent-inject-template-platform-deploy-token: |
+          {{- with secret "secret/data/platform-deploy-service" -}}{{ .Data.data.token }}{{- end }}
+        vault.hashicorp.com/agent-inject-secret-platform-notification-token: "secret/data/platform-notification-service/clients/graphql-platform-operation-worker"
+        vault.hashicorp.com/agent-inject-template-platform-notification-token: |
+          {{- with secret "secret/data/platform-notification-service/clients/graphql-platform-operation-worker" -}}{{ .Data.data.token }}{{- end }}
+        vault.hashicorp.com/agent-inject-secret-runtime-status-token: "secret/data/runtime-status-service"
+        vault.hashicorp.com/agent-inject-template-runtime-status-token: |
+          {{- with secret "secret/data/runtime-status-service" -}}{{ .Data.data.token }}{{- end }}
+    spec:
+      serviceAccountName: graphql-platform-operation-worker
+      containers:
+        - name: worker
+          image: python:3.12-slim
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: PYTHONUNBUFFERED, value: "1" }
+            - { name: KAFKA_BOOTSTRAP_SERVERS, value: "kafka.kafka.svc.internal.lan:9092" }
+            - { name: REQUEST_TOPIC, value: "graphql.async.requests.v1" }
+            - { name: RESPONSE_TOPIC, value: "graphql.async.responses.v1" }
+            - { name: CONSUMER_GROUP, value: "graphql-operation-platform-worker-v1" }
+            - { name: HANDLER, value: "platform-operation-worker" }
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              set -euo pipefail
+              pip install --no-cache-dir --disable-pip-version-check "kafka-python>=2.0.2,<3.0.0"
+              exec python /opt/config/worker.py
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "test -s /tmp/health/heartbeat && test $(( $(date +%s) - $(cut -d. -f1 /tmp/health/heartbeat) )) -lt 30"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "test -s /tmp/health/heartbeat && test $(( $(date +%s) - $(cut -d. -f1 /tmp/health/heartbeat) )) -lt 240"]
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests: { cpu: 10m, memory: 48Mi }
+            limits: { cpu: 200m, memory: 128Mi }
+          volumeMounts:
+            - { name: worker-config, mountPath: /opt/config, readOnly: true }
+      volumes:
+        - name: worker-config
+          configMap: { name: graphql-platform-operation-worker, defaultMode: 0555 }

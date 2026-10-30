@@ -497,6 +497,20 @@ spec:
                 policies="graphql-operation-test-worker,${ROLE_STATIC_OPERATION_WORKER_RO}" \
                 ttl="48h"
 
+              vault policy write "graphql-platform-operation-worker" - <<'EOF'
+              path "secret/data/graphql-kafka-async-username" { capabilities = ["read"] }
+              path "secret/data/graphql-kafka-async-password" { capabilities = ["read"] }
+              path "secret/data/platform-deploy-service" { capabilities = ["read"] }
+              path "secret/data/platform-notification-service/clients/graphql-platform-operation-worker" { capabilities = ["read"] }
+              path "secret/data/runtime-status-service" { capabilities = ["read"] }
+              EOF
+
+              vault write auth/${AUTH_PATH}/role/graphql-platform-operation-worker \
+                bound_service_account_names="graphql-platform-operation-worker" \
+                bound_service_account_namespaces="graphql" \
+                policies="graphql-platform-operation-worker" \
+                ttl="48h"
+
               vault write auth/${AUTH_PATH}/role/graphql-async-cleanup \
                 bound_service_account_names="graphql-async-cleanup" \
                 bound_service_account_namespaces="graphql" \

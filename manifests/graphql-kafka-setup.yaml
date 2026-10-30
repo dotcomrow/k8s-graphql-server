@@ -62,7 +62,7 @@ spec:
             - name: KAFKA_DLQ_PARTITIONS
               value: "3"
             - name: KAFKA_REPLICATION_FACTOR
-              value: "1"
+              value: "3"
             - name: KAFKA_REQUEST_RETENTION_MS
               value: "3600000"
             - name: KAFKA_RESPONSE_RETENTION_MS

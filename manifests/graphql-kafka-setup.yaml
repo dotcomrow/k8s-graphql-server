@@ -238,7 +238,7 @@ spec:
                   --alter \
                   --entity-type topics \
                   --entity-name "${topic}" \
-                  --add-config "retention.ms=${retention_ms},segment.ms=${segment_ms},cleanup.policy=delete,min.insync.replicas=1"
+                  --add-config "retention.ms=${retention_ms},segment.ms=${segment_ms},cleanup.policy=delete,min.insync.replicas=2"
 
                 kafka_cli_retry kafka-topics.sh --describe --topic "${topic}"
               }

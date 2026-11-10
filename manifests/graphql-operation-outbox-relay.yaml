@@ -314,13 +314,6 @@ spec:
               command: ["/bin/sh", "-c", "test -s /tmp/health/heartbeat && test $(( $(date +%s) - $(cut -d. -f1 /tmp/health/heartbeat) )) -lt 120"]
             initialDelaySeconds: 30
             periodSeconds: 20
-          resources:
-            requests:
-              cpu: 50m
-              memory: 96Mi
-            limits:
-              cpu: 500m
-              memory: 256Mi
           volumeMounts:
             - name: relay-config
               mountPath: /opt/config

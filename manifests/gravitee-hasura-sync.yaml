@@ -63,6 +63,12 @@ data:
     INSECURE_SKIP_VERIFY = os.environ.get("INSECURE_SKIP_VERIFY", "false").lower() in ("1", "true", "yes")
     MAX_MANAGED_ACTION_DROP_RATIO = float(os.environ.get("HASURA_MAX_MANAGED_ACTION_DROP_RATIO", "0.25"))
     MIN_MANAGED_ACTIONS_FOR_DROP_GUARD = int(os.environ.get("HASURA_MIN_MANAGED_ACTIONS_FOR_DROP_GUARD", "50"))
+    BROWSER_SUBSCRIPTION_PROOF_HEADER = "x-suncoast-browser-subscription-proof"
+    BROWSER_SUBSCRIPTION_PROOF_ACTIONS = {
+        "gravitee_platform_notification_api_resolvebrowsersubscription",
+        "gravitee_platform_notification_api_reconcilebrowsersubscription",
+        "gravitee_platform_notification_api_upsertbrowsersubscription",
+    }
 
     INTERNAL_JWK_URL = os.environ.get(
         "INTERNAL_JWK_URL",
@@ -1128,6 +1134,44 @@ data:
                 return v
         return None
 
+    def browser_subscription_proof(headers):
+        encoded = str(get_header_value(headers, BROWSER_SUBSCRIPTION_PROOF_HEADER) or "").strip()
+        if len(encoded) < 40 or len(encoded) > 2048 or not re.match(r"^[A-Za-z0-9_-]+$", encoded):
+            return None
+        try:
+            padded = encoded + ("=" * (-len(encoded) % 4))
+            decoded = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+            proof = json.loads(decoded)
+        except Exception:
+            return None
+        if not isinstance(proof, dict):
+            return None
+        subscription_id = str(proof.get("subscriptionId") or "").strip()
+        installation_id = str(proof.get("installationId") or "").strip()
+        secret = str(proof.get("secret") or "").strip()
+        if not subscription_id or not installation_id or len(secret) < 32 or len(secret) > 512:
+            return None
+        return {
+            "subscription_id": subscription_id,
+            "installation_id": installation_id,
+            "secret": secret,
+        }
+
+    def attach_browser_subscription_proof(action_name, input_data, request_headers):
+        if action_name not in BROWSER_SUBSCRIPTION_PROOF_ACTIONS or not isinstance(input_data, dict):
+            return
+        proof = browser_subscription_proof(request_headers)
+        body = extract_body(input_data)
+        if not proof or not isinstance(body, dict):
+            return
+        subscription_id = str(body.get("browser_subscription_id") or "").strip()
+        installation_id = str(body.get("browser_installation_id") or "").strip()
+        if subscription_id != proof["subscription_id"] or installation_id != proof["installation_id"]:
+            return
+        body["browser_subscription_client_secret"] = proof["secret"]
+        if "body" in input_data:
+            input_data["body"] = body
+
     def handle_action(action_name, input_data, auth_header):
         with ACTION_LOCK:
             entry = ACTION_MAP.get(action_name)
@@ -1372,6 +1416,19 @@ data:
                         request_headers_payload = normalize_request_headers(
                             payload.get("headers")
                         )
+                    incoming_browser_proof = self.headers.get(
+                        "X-Suncoast-Browser-Subscription-Proof"
+                    )
+                    if incoming_browser_proof and not get_header_value(
+                        request_headers_payload,
+                        BROWSER_SUBSCRIPTION_PROOF_HEADER,
+                    ):
+                        request_headers_payload[BROWSER_SUBSCRIPTION_PROOF_HEADER] = incoming_browser_proof
+                    attach_browser_subscription_proof(
+                        action_name,
+                        input_data,
+                        request_headers_payload,
+                    )
                     payload_request = payload.get("request") if isinstance(payload, dict) else None
                     request_keys = payload_request.keys() if isinstance(payload_request, dict) else []
                     request_headers_raw = (
